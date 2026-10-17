@@ -11,13 +11,28 @@ const RECORD_END = "--end--";
  * Reports go out as real subprocesses, so this is what lets a test assert on the wire format and
  * the order of the reports Octo sends, without a Herdr install. Callers register `dir` for cleanup.
  */
-export function fakeHerdrBinary() {
+export function fakeHerdrBinary(options: { versions?: { client: string; server: string } } = {}) {
   const dir = fs.mkdtempSync(join(os.tmpdir(), "octo-herdr-bin-"));
   const logPath = join(dir, "reports");
   const binPath = join(dir, "herdr");
+  // A stub that answers `status --json` as a real Herdr from `options.versions` would, and records
+  // every other call's argv. Without versions it answers nothing, which is the probe failing.
+  const status =
+    options.versions == null
+      ? ""
+      : [
+          `if [ "$1" = "status" ]; then`,
+          `  printf '%s\\n' '${JSON.stringify({
+            client: { version: options.versions.client },
+            server: { version: options.versions.server },
+          })}'`,
+          `  exit 0`,
+          `fi`,
+          "",
+        ].join("\n");
   fs.writeFileSync(
     binPath,
-    `#!/bin/sh\n{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
+    `#!/bin/sh\n${status}{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
   );
   fs.chmodSync(binPath, 0o755);
 

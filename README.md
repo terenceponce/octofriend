@@ -430,6 +430,11 @@ with, so a restored session behaves like the original one. Restoring needs Herdr
 `canary-octo` for a canary build) to be on your `PATH`. If it isn't, Octo leaves
 the resume command off the report and Herdr opens a plain shell instead.
 
+Octo asks Herdr for its version when it starts, and only reports a resume command
+to a Herdr that understands one: older versions reject the report carrying it,
+which would cost you the state updates as well. State, blocked messages, and
+release work on every version.
+
 Sessions that ran inside Docker restore the same way: a `docker connect` session
 reconnects to its container, and a `docker run` session starts a fresh container
 from the same arguments.

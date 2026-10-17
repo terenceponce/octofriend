@@ -3,13 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 import {
+  CONSERVATIVE_HERDR_CAPABILITIES,
   createHerdrReporter,
+  herdrCapabilitiesFromStatus,
   herdrReportFor,
   herdrResumeFor,
   herdrSettingsFor,
   herdrStatusFor,
+  readHerdrCapabilities,
   readHerdrEnv,
   startHerdrIntegration,
+  type HerdrCapabilities,
   type HerdrEnv,
   type HerdrSettings,
   type HerdrState,
@@ -25,6 +29,9 @@ import { MockTransport, type MockProcessCall } from "./transports/mock.ts";
 import { fakeHerdrBinary } from "./test/fake-herdr.ts";
 
 const HERDR_ENV: HerdrEnv = { binPath: "/opt/herdr/bin/herdr", paneId: "pane-7" };
+// A Herdr new enough to restore panes from a reported command; the ones that aren't get their own
+// tests below.
+const NEW_HERDR: HerdrCapabilities = { resumeCommand: true };
 
 const tempDirs: string[] = [];
 
@@ -49,8 +56,8 @@ function settings(overrides: Partial<HerdrSettings> = {}): HerdrSettings {
   return { enabled: true, agentName: "octofriend", resumeCommand: null, ...overrides };
 }
 
-function reporterFor(transport: Transport, agentName = "octofriend") {
-  return createHerdrReporter({ env: HERDR_ENV, agentName, transport });
+function reporterFor(transport: Transport, agentName = "octofriend", capabilities = NEW_HERDR) {
+  return createHerdrReporter({ env: HERDR_ENV, agentName, capabilities, transport });
 }
 
 type OctoMode = TrajectoryMode<typeof octoAgent>["mode"];
@@ -150,11 +157,12 @@ function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
 }
 
 /* A stub HERDR_BIN_PATH that records the argv it receives, so tests can read the wire format. */
-function herdrStub() {
-  const herdr = fakeHerdrBinary();
+function herdrStub(versions?: { client: string; server: string }) {
+  const herdr = fakeHerdrBinary({ versions });
   tempDirs.push(herdr.dir);
   return {
     binPath: herdr.binPath,
+    env: { binPath: herdr.binPath, paneId: "pane-7" },
     async calls(count: number): Promise<string[][]> {
       await waitFor(() => herdr.records().length >= count);
       return herdr.records();
@@ -342,6 +350,61 @@ describe("herdrSettingsFor", () => {
       agentName: "octofriend",
       resumeCommand: "octo",
     });
+  });
+});
+
+describe("herdrCapabilitiesFromStatus", () => {
+  const status = (client: string, server: string) =>
+    JSON.stringify({ client: { version: client }, server: { version: server } });
+
+  it("only offers resume commands to a Herdr that understands them", () => {
+    expect(herdrCapabilitiesFromStatus(status("0.9.2", "0.9.2"))).toEqual(NEW_HERDR);
+    expect(herdrCapabilitiesFromStatus(status("0.9.20", "0.9.20"))).toEqual(NEW_HERDR);
+    expect(herdrCapabilitiesFromStatus(status("0.10.0", "0.10.0"))).toEqual(NEW_HERDR);
+    expect(herdrCapabilitiesFromStatus(status("1.0.0", "1.0.0"))).toEqual(NEW_HERDR);
+    expect(herdrCapabilitiesFromStatus(status("0.9.1", "0.9.1"))).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+    expect(herdrCapabilitiesFromStatus(status("0.8.0", "0.8.0"))).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+  });
+
+  it("needs the CLI that parses reports and the server that acts on them to agree", () => {
+    // An update can leave a new CLI talking to a server that hasn't been restarted yet.
+    expect(herdrCapabilitiesFromStatus(status("0.9.5", "0.8.0"))).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+    expect(herdrCapabilitiesFromStatus(status("0.8.0", "0.9.5"))).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+  });
+
+  it("offers nothing when Herdr's version can't be read", () => {
+    expect(herdrCapabilitiesFromStatus("")).toEqual(CONSERVATIVE_HERDR_CAPABILITIES);
+    expect(herdrCapabilitiesFromStatus("not json")).toEqual(CONSERVATIVE_HERDR_CAPABILITIES);
+    expect(herdrCapabilitiesFromStatus("{}")).toEqual(CONSERVATIVE_HERDR_CAPABILITIES);
+    expect(herdrCapabilitiesFromStatus(status("latest", "0.9.5"))).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+  });
+});
+
+describe("readHerdrCapabilities", () => {
+  it("reads what the Herdr binary in this pane understands", async () => {
+    const herdr = herdrStub({ client: "0.9.2", server: "0.9.2" });
+    expect(await readHerdrCapabilities(herdr.env, new LocalTransport())).toEqual(NEW_HERDR);
+  });
+
+  it("assumes nothing when the probe fails or there is no pane", async () => {
+    // The stub answers no version, and reporting state matters more than offering a resume.
+    const herdr = herdrStub();
+    expect(await readHerdrCapabilities(herdr.env, new LocalTransport())).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
+    expect(await readHerdrCapabilities(null, new LocalTransport())).toEqual(
+      CONSERVATIVE_HERDR_CAPABILITIES,
+    );
   });
 });
 
@@ -565,11 +628,16 @@ describe("createHerdrReporter", () => {
  */
 describe("reports sent to a real Herdr binary", () => {
   it("sends the state, the block's message, and the resume command", async () => {
-    const herdr = herdrStub();
+    const herdr = herdrStub({ client: "0.9.2", server: "0.9.2" });
+    const transport = new LocalTransport();
+    const capabilities = await readHerdrCapabilities(herdr.env, transport);
+    expect(capabilities).toEqual(NEW_HERDR);
+
     const reporter = createHerdrReporter({
-      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      env: herdr.env,
       agentName: "octofriend",
-      transport: new LocalTransport(),
+      capabilities,
+      transport,
     });
 
     reporter.report({
@@ -603,11 +671,51 @@ describe("reports sent to a real Herdr binary", () => {
     ]);
   });
 
+  it("keeps the session out of reports to a server that predates resume commands", async () => {
+    // Herdr 0.8.0 answers the trailing argv with `unknown option: --` and exits 2, and that
+    // rejection takes the state report it rode on down with it: reporting the session there keeps
+    // the pane permanently idle in Herdr's sidebar.
+    const herdr = herdrStub({ client: "0.8.0", server: "0.8.0" });
+    const transport = new LocalTransport();
+    const capabilities = await readHerdrCapabilities(herdr.env, transport);
+    expect(capabilities).toEqual(CONSERVATIVE_HERDR_CAPABILITIES);
+
+    const reporter = createHerdrReporter({
+      env: herdr.env,
+      agentName: "octofriend",
+      capabilities,
+      transport,
+    });
+    reporter.report({
+      state: "blocked",
+      message: "Waiting for permission: shell",
+      resume: { sessionId: "session-1", argv: ["octo", "--resume", "session-1"] },
+    });
+
+    const [record] = await herdr.calls(1);
+    expect(maskSeq(record)).toEqual([
+      "pane",
+      "report-agent",
+      "pane-7",
+      "--source",
+      "octofriend",
+      "--agent",
+      "octofriend",
+      "--state",
+      "blocked",
+      "--seq",
+      "<seq>",
+      "--message",
+      "Waiting for permission: shell",
+    ]);
+  });
+
   it("releases the pane with a higher seq than the reports before it", async () => {
     const herdr = herdrStub();
     const reporter = createHerdrReporter({
-      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      env: herdr.env,
       agentName: "octofriend",
+      capabilities: NEW_HERDR,
       transport: new LocalTransport(),
     });
 
@@ -650,7 +758,13 @@ describe("startHerdrIntegration", () => {
   it("does nothing outside a Herdr pane", () => {
     const transport = new MockTransport({});
     const source = fakeSource({ mode: "booting" });
-    const stop = startHerdrIntegration({ env: null, settings: settings(), transport, source });
+    const stop = startHerdrIntegration({
+      env: null,
+      settings: settings(),
+      capabilities: NEW_HERDR,
+      transport,
+      source,
+    });
 
     source.set(liveState({ mode: "responding", sessionId: "session-1" }));
     stop();
@@ -664,6 +778,7 @@ describe("startHerdrIntegration", () => {
     const stop = startHerdrIntegration({
       env: HERDR_ENV,
       settings: settings({ enabled: false }),
+      capabilities: NEW_HERDR,
       transport,
       source,
     });
@@ -678,7 +793,13 @@ describe("startHerdrIntegration", () => {
   it("reports state changes, skipping reports that change nothing", () => {
     const transport = new MockTransport({});
     const source = fakeSource({ mode: "booting" });
-    const stop = startHerdrIntegration({ env: HERDR_ENV, settings: settings(), transport, source });
+    const stop = startHerdrIntegration({
+      env: HERDR_ENV,
+      settings: settings(),
+      capabilities: NEW_HERDR,
+      transport,
+      source,
+    });
     expect(transport.spawnCalls).toHaveLength(0);
 
     source.set(liveState({ mode: "responding", sessionId: "session-1" }));
@@ -706,6 +827,7 @@ describe("startHerdrIntegration", () => {
     startHerdrIntegration({
       env: HERDR_ENV,
       settings: settings({ resumeCommand: "octo" }),
+      capabilities: NEW_HERDR,
       transport,
       source,
     });
@@ -739,6 +861,7 @@ describe("startHerdrIntegration", () => {
     startHerdrIntegration({
       env: HERDR_ENV,
       settings: settings({ resumeCommand: "octo" }),
+      capabilities: NEW_HERDR,
       transport,
       source,
     });

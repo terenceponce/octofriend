@@ -44,7 +44,7 @@ import type { LoadedTools, ToolCall } from "./libocto/tool-def.ts";
 import type { octoAgent } from "./ir/octo-ir.ts";
 import type toolMap from "./tools/tool-defs/index.ts";
 import { LocalTransport } from "./transports/local.ts";
-import { startHerdrIntegration } from "./herdr.ts";
+import { readHerdrCapabilities, startHerdrIntegration } from "./herdr.ts";
 import { fakeHerdrBinary, stateOf } from "./test/fake-herdr.ts";
 
 /*
@@ -1110,12 +1110,17 @@ describe("herdr reporting", () => {
 
     // Start reporting once this session is booted: the store is shared across this file, so
     // otherwise the first thing reported would be whatever session the previous test left behind.
-    const herdr = fakeHerdrBinary();
+    // The stub answers `status --json`, standing in for a Herdr that supports resume commands.
+    const herdr = fakeHerdrBinary({ versions: { client: "0.9.2", server: "0.9.2" } });
     tempDirs.push(herdr.dir);
+    const herdrEnv = { binPath: herdr.binPath, paneId: "pane-7" };
+    const herdrTransport = new LocalTransport();
     const stopHerdr = startHerdrIntegration({
-      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      env: herdrEnv,
       settings: { enabled: true, agentName: "octofriend", resumeCommand: "octo" },
-      transport: new LocalTransport(),
+      // Read from the stub, which answers `status --json` as a Herdr that supports resume commands.
+      capabilities: await readHerdrCapabilities(herdrEnv, herdrTransport),
+      transport: herdrTransport,
       source: useAppStore,
     });
 

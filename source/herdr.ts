@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { delimiter, join } from "node:path";
 import { buildOctoFlags } from "./cli/cli-args.ts";
+import { errorToString } from "./libocto/result.ts";
+import * as logger from "./logger.ts";
 import type { Config } from "./config.ts";
 import type { LiveMirror } from "./state.ts";
 import type { Session } from "./session-history/index.ts";
@@ -35,8 +37,17 @@ const DEFAULT_RESUME_COMMAND = "octo";
 // sessions offer the checkout's `canary-octo` command instead. canary.sh puts that command on PATH;
 // if it isn't there, the session reports no resume command at all rather than the wrong build.
 const DEFAULT_CANARY_RESUME_COMMAND = "canary-octo";
+/*
+ * Herdr learned to restore panes from a reported command in 0.9.2. An older CLI answers the
+ * trailing argv that carries it with `unknown option: --` and exits 2, and the rejection takes the
+ * state report it was attached to down with it, so the command has to stay off the wire until both
+ * the CLI parsing our report and the server acting on it are new enough.
+ */
+const MIN_RESUME_COMMAND_VERSION: readonly [number, number, number] = [0, 9, 2];
 // Reports are best-effort: a slow or wedged Herdr must never hold up Octo.
 const REPORT_TIMEOUT_MS = 2000;
+// The one startup probe, asking Herdr what it understands.
+const PROBE_TIMEOUT_MS = 2000;
 // Herdr's limits on a resume command; see "Report the resume command" in the docs.
 const MAX_RESUME_ARGS = 64;
 const MAX_RESUME_BYTES = 8 * 1024;
@@ -52,6 +63,76 @@ export function readHerdrEnv(env: NodeJS.ProcessEnv = process.env): HerdrEnv | n
   const paneId = env["HERDR_PANE_ID"];
   if (!binPath || !paneId) return null;
   return { binPath, paneId };
+}
+
+export type HerdrCapabilities = {
+  // Whether a report may carry the command Herdr should re-run to bring the pane's session back.
+  resumeCommand: boolean;
+};
+
+/*
+ * What to assume when Herdr never told us: reporting state is the whole point of the integration,
+ * and guessing wrong about a resume command costs the state report it rides on, so the guess is
+ * always "no resume commands".
+ */
+export const CONSERVATIVE_HERDR_CAPABILITIES: HerdrCapabilities = { resumeCommand: false };
+
+/*
+ * Reads the client and server versions out of `herdr status --json`. Both have to be new enough:
+ * the CLI is what parses our report and rejects an argv it doesn't know, and the server is what
+ * turns a resume command into a restored pane. They can differ after an update, before the server
+ * has been restarted.
+ */
+export function herdrCapabilitiesFromStatus(status: string): HerdrCapabilities {
+  try {
+    const parsed: unknown = JSON.parse(status);
+    const { client, server } = (parsed ?? {}) as {
+      client?: { version?: unknown };
+      server?: { version?: unknown };
+    };
+    return {
+      resumeCommand:
+        versionAtLeast(client?.version, MIN_RESUME_COMMAND_VERSION) &&
+        versionAtLeast(server?.version, MIN_RESUME_COMMAND_VERSION),
+    };
+  } catch {
+    return CONSERVATIVE_HERDR_CAPABILITIES;
+  }
+}
+
+function versionAtLeast(version: unknown, minimum: readonly [number, number, number]): boolean {
+  if (typeof version !== "string") return false;
+  const parts = version.split(".").map(part => Number.parseInt(part, 10));
+  if (parts.length < minimum.length || parts.some(part => !Number.isFinite(part))) return false;
+  for (let index = 0; index < minimum.length; index++) {
+    if (parts[index] !== minimum[index]) return parts[index]! > minimum[index]!;
+  }
+  return true;
+}
+
+// The one place Octo asks Herdr about itself rather than reporting to it.
+export async function readHerdrCapabilities(
+  env: HerdrEnv | null,
+  transport: Transport,
+): Promise<HerdrCapabilities> {
+  if (env == null) return CONSERVATIVE_HERDR_CAPABILITIES;
+  try {
+    const status = await new Promise<string>((resolve, reject) => {
+      transport.execFile(
+        env.binPath,
+        ["status", "--json"],
+        { timeout: PROBE_TIMEOUT_MS },
+        (error, stdout) => {
+          if (error == null) resolve(stdout);
+          else reject(error);
+        },
+      );
+    });
+    return herdrCapabilitiesFromStatus(status);
+  } catch (error) {
+    logger.error("verbose", `Could not read Herdr's capabilities: ${errorToString(error)}`);
+    return CONSERVATIVE_HERDR_CAPABILITIES;
+  }
 }
 
 export type HerdrAgentState = "idle" | "working" | "blocked";
@@ -230,9 +311,10 @@ export type HerdrReporter = {
 export function createHerdrReporter(args: {
   env: HerdrEnv;
   agentName: string;
+  capabilities: HerdrCapabilities;
   transport: Transport;
 }): HerdrReporter {
-  const { env, agentName, transport } = args;
+  const { env, agentName, capabilities, transport } = args;
   let lastSeq = 0;
   let sending = false;
   let pending: HerdrReport | null = null;
@@ -265,13 +347,16 @@ export function createHerdrReporter(args: {
     pending = null;
     sending = true;
     try {
-      const reported = spawnReport(reportArgv(env, agentName, report, nextSeq()));
-      reported.once("close", () => {
+      const argv = reportArgv(env, agentName, capabilities, report, nextSeq());
+      const reported = spawnReport(argv);
+      reported.once("close", code => {
+        logRejectedReport(argv, code);
         sending = false;
         flush();
       });
-    } catch {
+    } catch (error) {
       // Reports are best-effort: Herdr being unhappy is not Octo's problem.
+      logger.error("verbose", `Could not run the Herdr binary: ${errorToString(error)}`);
       sending = false;
       flush();
     }
@@ -288,18 +373,19 @@ export function createHerdrReporter(args: {
       if (released) return;
       released = true;
       pending = null;
+      const argv = [
+        "pane",
+        "release-agent",
+        env.paneId,
+        "--source",
+        HERDR_SOURCE,
+        "--agent",
+        agentName,
+        "--seq",
+        String(nextSeq()),
+      ];
       try {
-        spawnReport([
-          "pane",
-          "release-agent",
-          env.paneId,
-          "--source",
-          HERDR_SOURCE,
-          "--agent",
-          agentName,
-          "--seq",
-          String(nextSeq()),
-        ]);
+        spawnReport(argv).once("close", code => logRejectedReport(argv, code));
       } catch {
         // Nothing to do: Herdr clears the agent itself once the pane is back at its shell.
       }
@@ -307,7 +393,24 @@ export function createHerdrReporter(args: {
   };
 }
 
-function reportArgv(env: HerdrEnv, agentName: string, report: HerdrReport, seq: number): string[] {
+/*
+ * A rejected report is invisible by design: the output is discarded, and Herdr simply keeps showing
+ * whatever it last accepted. That silence is how a server that refuses our argv froze the sidebar
+ * for a whole session, so under OCTO_VERBOSE the command and its exit code are at least said out
+ * loud, and can be re-run by hand to see what Herdr made of it.
+ */
+function logRejectedReport(argv: string[], code: number | null) {
+  if (code === 0) return;
+  logger.error("verbose", `herdr ${argv.join(" ")}\n  exited with code ${code}`);
+}
+
+function reportArgv(
+  env: HerdrEnv,
+  agentName: string,
+  capabilities: HerdrCapabilities,
+  report: HerdrReport,
+  seq: number,
+): string[] {
   const argv = [
     "pane",
     "report-agent",
@@ -322,7 +425,13 @@ function reportArgv(env: HerdrEnv, agentName: string, report: HerdrReport, seq: 
     String(seq),
   ];
   if (report.message != null) argv.push("--message", report.message);
-  if (report.resume != null) {
+  /*
+   * What the server understands decides what goes on the wire. A Herdr older than 0.9.2 answers the
+   * resume command's trailing argv with `unknown option: --` and exits 2, and that rejection takes
+   * the state report it rode on down with it. On those servers the session stays out of the report
+   * entirely: a pane that shows Octo's state but can't be restored beats one that never updates.
+   */
+  if (report.resume != null && capabilities.resumeCommand) {
     argv.push("--agent-session-id", report.resume.sessionId, "--", ...report.resume.argv);
   }
   return argv;
@@ -340,14 +449,16 @@ export type HerdrStatusSource = {
 export function startHerdrIntegration(args: {
   env: HerdrEnv | null;
   settings: HerdrSettings;
+  capabilities: HerdrCapabilities;
   transport: Transport;
   source: HerdrStatusSource;
 }): () => void {
-  const { env, settings } = args;
+  const { env, settings, capabilities } = args;
   if (env == null || !settings.enabled) return () => {};
   const reporter = createHerdrReporter({
     env,
     agentName: settings.agentName,
+    capabilities,
     transport: args.transport,
   });
   let lastKey: string | null = null;

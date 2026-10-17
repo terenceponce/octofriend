@@ -42,7 +42,12 @@ import {
 } from "../session-history/session-list.ts";
 import { renderInteractive } from "./render-interactive.tsx";
 import { setOctoTitles } from "./titles.ts";
-import { herdrSettingsFor, readHerdrEnv, startHerdrIntegration } from "../herdr.ts";
+import {
+  herdrSettingsFor,
+  readHerdrCapabilities,
+  readHerdrEnv,
+  startHerdrIntegration,
+} from "../herdr.ts";
 import changelog from "../../CHANGELOG.md" with { type: "text" };
 import { processes } from "../process-manager.ts";
 
@@ -217,10 +222,14 @@ async function runMain(opts: {
     // Reports Octo's state to Herdr when Octo runs in one of its panes, and does nothing otherwise.
     // The Herdr binary runs on the host, so reports go through a local transport even when the
     // session itself is sandboxed in Docker.
+    const herdrEnv = readHerdrEnv();
+    const herdrTransport = new LocalTransport();
     stopHerdr = startHerdrIntegration({
-      env: readHerdrEnv(),
+      env: herdrEnv,
       settings: herdrSettingsFor(config.herdr),
-      transport: new LocalTransport(),
+      // One probe at startup, so no report has to guess at what this Herdr understands.
+      capabilities: await readHerdrCapabilities(herdrEnv, herdrTransport),
+      transport: herdrTransport,
       source: useAppStore,
     });
 
