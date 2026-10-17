@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import {
   inputFieldAvailable,
+  promptLiveSession,
   useAppStore,
   type PermissionUiState,
   type SessionMode,
@@ -50,8 +51,8 @@ import { fakeHerdrBinary, stateOf } from "./test/fake-herdr.ts";
 /*
  * Integration tests for the octo store wiring around libocto's Trajectory: history persistence
  * (exactly-once, on the same branch), the permission-gate store mirror, error-mode rectification
- * mirrors, and session lifecycle (boot/hydrate/swap/lost). Trajectory semantics themselves are
- * covered by source/libocto/trajectory.test.ts and are not re-tested here.
+ * mirrors, session lifecycle (boot/hydrate/swap/lost), and launch prompts. Trajectory semantics
+ * themselves are covered by source/libocto/trajectory.test.ts and are not re-tested here.
  */
 
 type OctoAgent = typeof octoAgent;
@@ -469,6 +470,43 @@ describe("boot and response mirror", () => {
     const firstId = first.session.metadata.sessionId!;
     expect(secondId).not.toBe(firstId);
     expect(dbLlmIrCount(firstId, "first-assistant-marker")).toBe(1);
+  });
+});
+
+/*
+ * Launch prompts (`octo --prompt`): a session that has just booted is parked in ready-for-request,
+ * so a message handed to it there is the first thing the model sees and starts the turn on its own,
+ * with no one at the keyboard. This is how an orchestrator gives an agent its instructions.
+ */
+describe("launch prompt", () => {
+  it("sends the prompt as the first user message and runs a turn", async () => {
+    const { session, compilerCalls } = await bootSession([plain("launch-prompt-assistant-marker")]);
+
+    await waitForNextTurn(() => promptLiveSession("launch-prompt-user-marker"));
+
+    expect(historyRoles()).toEqual(["user", "assistant"]);
+    expect(compilerCalls.length).toBe(1);
+    expect(compilerCalls[0].irs.map(ir => ir.role)).toEqual(["user"]);
+
+    const sessionId = session.metadata.sessionId ?? sessionError(new Error("no session id"));
+    expect(dbNodeCount(sessionId)).toBe(2);
+    expect(dbLlmIrCount(sessionId, "launch-prompt-user-marker")).toBe(1);
+    expect(dbLlmIrCount(sessionId, "launch-prompt-assistant-marker")).toBe(1);
+  });
+
+  it("refuses to send when no session is live", async () => {
+    useAppStore.setState({ sessionMode: { mode: "booting", control: bootControls } });
+    expect(await promptLiveSession("no-session-marker")).toBe(false);
+  });
+
+  it("refuses to send once the session has exited", async () => {
+    await bootSession([]);
+    const live = currentLive() ?? sessionError(new Error("expected a live session"));
+    live.trajectory.exitController.abort();
+    await live.trajectory.runPromise;
+    expect(currentLive()!.liveMode.trajectoryMode.mode).toBe("aborted");
+
+    expect(await promptLiveSession("too-late-marker")).toBe(false);
   });
 });
 

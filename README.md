@@ -102,6 +102,48 @@ run` arguments:
 octo --resume <session-id> [new docker run args...]
 ```
 
+## Starting Octo with a prompt
+
+Octo can start working the moment it launches, without anyone typing the first
+message:
+
+```bash
+octo --prompt "Add a test for the retry logic in source/retry.ts"
+```
+
+The message is sent as the first thing in the session, exactly as if you had
+typed it, and shows up in the transcript that way. If your instructions are
+long, or live in a file, use `--prompt-file` and skip the shell quoting:
+
+```bash
+octo --prompt-file /tmp/agent-prompt.md
+```
+
+`--prompt-file` reads the file on the machine you ran the command on, like
+`--config` does. The two flags are mutually exclusive: passing both is an
+error, so a mistyped command can't silently send the wrong thing. And because
+`--prompt` combines with `--resume`, you can wake a session back up with new
+instructions:
+
+```bash
+octo --resume <session-id> --prompt "The tests passed. Now open the PR."
+```
+
+This is the shape a script or an orchestrator uses to launch Octo as one agent
+among several. Two things are worth knowing before you do that, though:
+
+- Octo still confirms file edits and shell commands in collaboration mode, so
+  an unattended launch will sit and wait for a permission prompt. If nobody is
+  watching, decide deliberately between a broad whitelist and `--unchained`.
+- The prompt is a one-shot: it isn't recorded as a launch flag, so a later
+  `octo --resume` brings the conversation back without re-sending it (by then
+  it's in the session's history anyway).
+
+There is no `--model` flag: an interactive session uses the first model in its
+config. To pin a model for a project, point `--config` at a config file whose
+first entry is the model you want (a resumed session keeps the model it was
+already using).
+
 ## Attaching images
 
 If your currently-selected model has image input enabled, you can attach

@@ -795,6 +795,22 @@ export const useAppStore = create<UiState>((set, get) => {
   };
 });
 
+/*
+ * Hands a message to the live session as if the user had typed it, for the CLIs that start with one
+ * (`octo --prompt`). A session parks in ready-for-request the moment it boots, and steering handed
+ * to a parked loop folds into the very next request, so this is what starts a launched agent's
+ * first turn without a human pressing Enter. False means there was no parked, live session to hand
+ * the message to, and nothing was sent.
+ */
+export async function promptLiveSession(text: string): Promise<boolean> {
+  const { sessionMode } = useAppStore.getState();
+  if (sessionMode.mode !== "live") return false;
+  const trajectoryMode = sessionMode.liveMode.trajectoryMode;
+  if (trajectoryMode.mode !== "ready-for-request") return false;
+  await trajectoryMode.control.enqueueSteering(userMessageContent(text));
+  return true;
+}
+
 export function useModel() {
   const { modelOverride } = useAppStore(
     useShallow(state => ({

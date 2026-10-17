@@ -3,6 +3,7 @@ import { setupDb } from "../db/setup.ts";
 setupDb();
 
 import React from "react";
+import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import chalk from "chalk";
@@ -32,7 +33,7 @@ import { replaceDockerRunArgs, replaceOctoFlags, withOctoFlags } from "./cli-arg
 import type { ParsedCliArgs } from "./cli-args.ts";
 import { deleteSession, listSessions, loadSession } from "../session-history/index.ts";
 import type { LoadedSession } from "../session-history/index.ts";
-import { useAppStore } from "../state.ts";
+import { promptLiveSession, useAppStore } from "../state.ts";
 import { THEME_COLOR } from "../theme.ts";
 import {
   SESSION_ID_HEADER,
@@ -62,6 +63,8 @@ const cli = withOctoFlags(
   new Command().description("If run with no subcommands, runs Octo interactively."),
 )
   .option("--resume <session-id>", "Resume a previous Octo session")
+  .option("--prompt <message>", "Send this message as soon as the session starts")
+  .option("--prompt-file <path>", "Send the contents of this file as soon as the session starts")
   .argument("[docker-run-args...]", "Optional replacement args for `docker run` when resuming")
   .action(async (dockerRunArgs, opts) => {
     const resumeSessionId = opts.resume ?? null;
@@ -70,6 +73,12 @@ const cli = withOctoFlags(
       process.exitCode = 1;
       return;
     }
+    if (opts.prompt != null && opts.promptFile != null) {
+      console.error("Use either --prompt or --prompt-file, not both.");
+      process.exitCode = 1;
+      return;
+    }
+    const initialPrompt = await resolveInitialPrompt(opts);
     let runConfig = null;
     if (resumeSessionId != null) {
       runConfig = await buildConfigForResuming(resumeSessionId, {
@@ -90,7 +99,7 @@ const cli = withOctoFlags(
       };
     }
 
-    await runMain(runConfig);
+    await runMain({ ...runConfig, initialPrompt });
   });
 
 const docker = cli.command("docker").description("Sandbox Octo inside Docker");
@@ -136,6 +145,27 @@ withOctoFlags(docker.command("run"))
       },
     });
   });
+
+/*
+ * The message an orchestrator launches Octo with, if any. A prompt file is read here, on the host
+ * that ran the command, rather than through the transport: the prompt belongs to the launcher, not
+ * to the sandbox, which is also how --config is read. An unreadable file exits instead of launching
+ * without the prompt it was asked to send.
+ */
+async function resolveInitialPrompt(opts: {
+  prompt?: string;
+  promptFile?: string;
+}): Promise<string | null> {
+  if (opts.promptFile == null) return opts.prompt ?? null;
+  try {
+    return await fs.readFile(opts.promptFile, "utf8");
+  } catch (e) {
+    console.error(
+      `Could not read --prompt-file ${opts.promptFile}: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    process.exit(1);
+  }
+}
 
 async function buildConfigForResuming(
   resumeSessionId: string,
@@ -202,6 +232,7 @@ async function runMain(opts: {
   parsedCliArgs: ParsedCliArgs;
   transport: Transport;
   loadedSession?: LoadedSession | null;
+  initialPrompt?: string | null;
 }) {
   const restoreTitles = setOctoTitles();
   // Filled in once the config is loaded, since Herdr reporting is configurable: the exit cleanup
@@ -306,6 +337,15 @@ async function runMain(opts: {
         config,
         transport: opts.transport,
       });
+    }
+
+    /*
+     * A prompt passed at launch starts the first turn, the way an orchestrator hands an agent its
+     * instructions. The session is parked and live by now, so the message lands as the user's.
+     */
+    if (opts.initialPrompt != null) {
+      const sent = await promptLiveSession(opts.initialPrompt);
+      if (!sent) console.error("Could not send --prompt: this session is not ready for it.");
     }
 
     const { waitUntilExit } = renderInteractive(
