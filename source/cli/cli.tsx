@@ -42,7 +42,7 @@ import {
 } from "../session-history/session-list.ts";
 import { renderInteractive } from "./render-interactive.tsx";
 import { setOctoTitles } from "./titles.ts";
-import { readHerdrEnv, startHerdrIntegration } from "../herdr.ts";
+import { herdrSettingsFor, readHerdrEnv, startHerdrIntegration } from "../herdr.ts";
 import changelog from "../../CHANGELOG.md" with { type: "text" };
 import { processes } from "../process-manager.ts";
 
@@ -197,12 +197,9 @@ async function runMain(opts: {
   loadedSession?: LoadedSession | null;
 }) {
   const restoreTitles = setOctoTitles();
-  // Reports Octo's state to Herdr when Octo runs in one of its panes, and does nothing otherwise.
-  const stopHerdr = startHerdrIntegration({
-    env: readHerdrEnv(),
-    transport: new LocalTransport(),
-    source: useAppStore,
-  });
+  // Filled in once the config is loaded, since Herdr reporting is configurable: the exit cleanup
+  // below is registered before that happens, so it needs something to call either way.
+  let stopHerdr: () => void = () => {};
   let cleanedUp = false;
   const cleanup = async () => {
     if (cleanedUp) return;
@@ -216,6 +213,16 @@ async function runMain(opts: {
   try {
     const syntheticModels = await loadSyntheticModels(AbortSignal.timeout(5000));
     const { config, configPath } = await loadConfig(opts.parsedCliArgs.config, syntheticModels);
+
+    // Reports Octo's state to Herdr when Octo runs in one of its panes, and does nothing otherwise.
+    // The Herdr binary runs on the host, so reports go through a local transport even when the
+    // session itself is sandboxed in Docker.
+    stopHerdr = startHerdrIntegration({
+      env: readHerdrEnv(),
+      settings: herdrSettingsFor(config.herdr),
+      transport: new LocalTransport(),
+      source: useAppStore,
+    });
 
     // Connect to all MCP servers on boot
     if (config.mcpServers && Object.keys(config.mcpServers).length > 0) {

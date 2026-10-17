@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { delimiter, join } from "node:path";
 import { buildOctoFlags } from "./cli/cli-args.ts";
+import type { Config } from "./config.ts";
 import type { LiveMirror } from "./state.ts";
 import type { Session } from "./session-history/index.ts";
 import type { Transport } from "./transports/transport-common.ts";
@@ -21,19 +22,19 @@ import type { Transport } from "./transports/transport-common.ts";
 
 // Herdr reserves the `herdr:` prefix for its own integrations.
 const HERDR_SOURCE = "octofriend";
-// The agent name users see in the sidebar and in `herdr agent list`.
-const HERDR_AGENT = "octofriend";
+// The agent name users see in the sidebar and in `herdr agent list`, unless the config overrides it.
+const DEFAULT_AGENT_NAME = "octofriend";
 /*
  * Herdr restores a pane by running the resume command itself, so its first word has to be a plain
  * command name that resolves on the user's PATH. Shell functions and aliases don't count, which is
  * why Octo checks for the command before offering it: a restore that lands on a missing command is
  * worse than no restore at all, and Herdr falls back to a plain shell in the saved directory.
  */
-const RESUME_COMMAND = "octo";
-// Canary runs are started by canary.sh's shell function, and the released `octo` on the user's
-// PATH would bring the session back on a different build. Canary users who want automatic restore
-// can put a real canary-octo executable on PATH instead.
-const CANARY_RESUME_COMMAND = "canary-octo";
+const DEFAULT_RESUME_COMMAND = "octo";
+// A canary session resumed with the released `octo` would come back as a different build, so canary
+// sessions offer the checkout's `canary-octo` command instead. canary.sh puts that command on PATH;
+// if it isn't there, the session reports no resume command at all rather than the wrong build.
+const DEFAULT_CANARY_RESUME_COMMAND = "canary-octo";
 // Reports are best-effort: a slow or wedged Herdr must never hold up Octo.
 const REPORT_TIMEOUT_MS = 2000;
 // Herdr's limits on a resume command; see "Report the resume command" in the docs.
@@ -86,11 +87,20 @@ export function herdrStatusFor(liveMode: LiveMirror): HerdrStatus {
   }
 
   switch (trajectoryMode.mode) {
-    // Octo is waiting for the user, either for a new request or for steering after a rejection.
+    // Octo is waiting for the user: for a new request, or for the pane back after ESC.
     case "ready-for-request":
-    case "tool-call-permission":
     case "aborted":
       return { state: "idle" };
+    /*
+     * Blocked either way, and deliberately mapped off the mode rather than the permission UI: the
+     * store resets permissionUi to idle in the same update that installs this mode, and only pushes
+     * the prompt afterwards. Reading the permission UI first would report a spurious "idle" in
+     * between, which shows up as a flicker in the sidebar and can fire a spurious notification.
+     */
+    case "tool-call-permission":
+      return permissionUi.type === "awaiting-steering"
+        ? { state: "blocked", message: "Waiting for your message" }
+        : { state: "blocked", message: "Waiting for permission" };
     // These park the turn until the user decides how to continue.
     case "request-error":
       return { state: "blocked", message: "Request error" };
@@ -114,11 +124,36 @@ export function herdrStatusFor(liveMode: LiveMirror): HerdrStatus {
   }
 }
 
-// The command Herdr should re-run for this session, or null when nothing on the user's PATH
-// could start Octo again.
-export function resolveResumeCommand(env: NodeJS.ProcessEnv = process.env): string | null {
-  const command = env["CANARY_OCTO"] === "1" ? CANARY_RESUME_COMMAND : RESUME_COMMAND;
-  return isExecutableOnPath(command, env["PATH"]) ? command : null;
+export type HerdrSettings = {
+  enabled: boolean;
+  // The name users see in the sidebar and in `herdr agent list`.
+  agentName: string;
+  // The command Herdr should re-run for this session, or null when nothing on the user's PATH
+  // could start Octo again.
+  resumeCommand: string | null;
+};
+
+/*
+ * Reads the `herdr` config section. Reports are on by default and still only ever happen inside a
+ * Herdr pane, and the resume command is chosen per pane from how this process was launched: `octo`
+ * and `canary-octo` are two builds sharing one config file, so no single configured command is
+ * correct for both. Herdr keeps resume state per pane, so panes can hold different commands.
+ */
+export function herdrSettingsFor(
+  herdr: Config["herdr"],
+  env: NodeJS.ProcessEnv = process.env,
+): HerdrSettings {
+  const resume = herdr?.resume;
+  const command =
+    env["CANARY_OCTO"] === "1"
+      ? (resume?.canaryCommand ?? DEFAULT_CANARY_RESUME_COMMAND)
+      : (resume?.command ?? DEFAULT_RESUME_COMMAND);
+
+  return {
+    enabled: herdr?.enabled !== false,
+    agentName: herdr?.agentName ?? DEFAULT_AGENT_NAME,
+    resumeCommand: isExecutableOnPath(command, env["PATH"]) ? command : null,
+  };
 }
 
 function isExecutableOnPath(command: string, searchPath: string | undefined): boolean {
@@ -138,10 +173,7 @@ function isExecutableOnPath(command: string, searchPath: string | undefined): bo
     });
 }
 
-export function herdrResumeFor(
-  session: Session,
-  resumeCommand: string | null = resolveResumeCommand(),
-): HerdrResume | null {
+export function herdrResumeFor(session: Session, resumeCommand: string | null): HerdrResume | null {
   if (resumeCommand == null) return null;
   const { sessionId, cliArgs } = session.metadata;
   // The session id is generated when the first history item is persisted, so there is nothing
@@ -175,7 +207,7 @@ export type HerdrState =
 
 export function herdrReportFor(
   sessionMode: HerdrState,
-  resumeCommand: string | null = resolveResumeCommand(),
+  resumeCommand: string | null,
 ): HerdrReport | null {
   switch (sessionMode.mode) {
     case "booting":
@@ -195,8 +227,12 @@ export type HerdrReporter = {
   release: () => void;
 };
 
-export function createHerdrReporter(args: { env: HerdrEnv; transport: Transport }): HerdrReporter {
-  const { env, transport } = args;
+export function createHerdrReporter(args: {
+  env: HerdrEnv;
+  agentName: string;
+  transport: Transport;
+}): HerdrReporter {
+  const { env, agentName, transport } = args;
   let lastSeq = 0;
   let sending = false;
   let pending: HerdrReport | null = null;
@@ -229,7 +265,7 @@ export function createHerdrReporter(args: { env: HerdrEnv; transport: Transport 
     pending = null;
     sending = true;
     try {
-      const reported = spawnReport(reportArgv(env, report, nextSeq()));
+      const reported = spawnReport(reportArgv(env, agentName, report, nextSeq()));
       reported.once("close", () => {
         sending = false;
         flush();
@@ -260,7 +296,7 @@ export function createHerdrReporter(args: { env: HerdrEnv; transport: Transport 
           "--source",
           HERDR_SOURCE,
           "--agent",
-          HERDR_AGENT,
+          agentName,
           "--seq",
           String(nextSeq()),
         ]);
@@ -271,7 +307,7 @@ export function createHerdrReporter(args: { env: HerdrEnv; transport: Transport 
   };
 }
 
-function reportArgv(env: HerdrEnv, report: HerdrReport, seq: number): string[] {
+function reportArgv(env: HerdrEnv, agentName: string, report: HerdrReport, seq: number): string[] {
   const argv = [
     "pane",
     "report-agent",
@@ -279,7 +315,7 @@ function reportArgv(env: HerdrEnv, report: HerdrReport, seq: number): string[] {
     "--source",
     HERDR_SOURCE,
     "--agent",
-    HERDR_AGENT,
+    agentName,
     "--state",
     report.state,
     "--seq",
@@ -303,15 +339,21 @@ export type HerdrStatusSource = {
 
 export function startHerdrIntegration(args: {
   env: HerdrEnv | null;
+  settings: HerdrSettings;
   transport: Transport;
   source: HerdrStatusSource;
 }): () => void {
-  if (args.env == null) return () => {};
-  const reporter = createHerdrReporter({ env: args.env, transport: args.transport });
+  const { env, settings } = args;
+  if (env == null || !settings.enabled) return () => {};
+  const reporter = createHerdrReporter({
+    env,
+    agentName: settings.agentName,
+    transport: args.transport,
+  });
   let lastKey: string | null = null;
 
   const publish = (sessionMode: HerdrState) => {
-    const report = herdrReportFor(sessionMode);
+    const report = herdrReportFor(sessionMode, settings.resumeCommand);
     if (report == null) return;
     const key = reportKey(report);
     if (key === lastKey) return;

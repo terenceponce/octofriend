@@ -1,16 +1,17 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import {
   createHerdrReporter,
   herdrReportFor,
   herdrResumeFor,
+  herdrSettingsFor,
   herdrStatusFor,
   readHerdrEnv,
-  resolveResumeCommand,
   startHerdrIntegration,
   type HerdrEnv,
+  type HerdrSettings,
   type HerdrState,
 } from "./herdr.ts";
 import type { LiveMirror } from "./state.ts";
@@ -19,6 +20,7 @@ import type { ParsedCliArgs } from "./cli/cli-args.ts";
 import type { octoAgent } from "./ir/octo-ir.ts";
 import type { TrajectoryMode } from "./libocto/trajectory.ts";
 import type { Transport } from "./transports/transport-common.ts";
+import { LocalTransport } from "./transports/local.ts";
 import { MockTransport, type MockProcessCall } from "./transports/mock.ts";
 
 const HERDR_ENV: HerdrEnv = { binPath: "/opt/herdr/bin/herdr", paneId: "pane-7" };
@@ -42,15 +44,12 @@ function binDir(commands: string[]): string {
   return dir;
 }
 
-function withPath<T>(dir: string, run: () => T): T {
-  const previous = process.env["PATH"];
-  process.env["PATH"] = `${dir}${delimiter}${previous ?? ""}`;
-  try {
-    return run();
-  } finally {
-    if (previous == null) delete process.env["PATH"];
-    else process.env["PATH"] = previous;
-  }
+function settings(overrides: Partial<HerdrSettings> = {}): HerdrSettings {
+  return { enabled: true, agentName: "octofriend", resumeCommand: null, ...overrides };
+}
+
+function reporterFor(transport: Transport, agentName = "octofriend") {
+  return createHerdrReporter({ env: HERDR_ENV, agentName, transport });
 }
 
 type OctoMode = TrajectoryMode<typeof octoAgent>["mode"];
@@ -92,21 +91,22 @@ function liveState(args: {
 }
 
 // Reports carry a timestamp-based seq, which is the one part of the argv tests can't pin down.
-function withoutSeq(call: MockProcessCall): string[] {
-  const args = [...call.args];
+function maskSeq(args: readonly string[]): string[] {
   const index = args.indexOf("--seq");
   expect(index).toBeGreaterThanOrEqual(0);
   return [...args.slice(0, index), "--seq", "<seq>", ...args.slice(index + 2)];
 }
 
-function seqOf(call: MockProcessCall): number {
-  const args = [...call.args];
+function withoutSeq(call: MockProcessCall): string[] {
+  return maskSeq(call.args);
+}
+
+function seqOf(args: readonly string[]): number {
   return Number(args[args.indexOf("--seq") + 1]);
 }
 
 function stateOf(call: MockProcessCall): string {
-  const args = [...call.args];
-  return args[args.indexOf("--state") + 1];
+  return call.args[call.args.indexOf("--state") + 1];
 }
 
 function fakeSource(initial: HerdrState) {
@@ -133,6 +133,52 @@ function fakeSource(initial: HerdrState) {
       for (const listener of listeners) listener(state, prevState);
     },
     listenerCount: () => listeners.size,
+  };
+}
+
+function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (cond()) return resolve();
+      if (Date.now() - start > timeoutMs) reject(new Error("Timed out waiting for condition"));
+      setTimeout(poll, 10);
+    };
+    poll();
+  });
+}
+
+const RECORD_END = "--end--";
+
+/*
+ * A stand-in for HERDR_BIN_PATH that records the argv it was called with, one argument per line,
+ * with a marker between calls so a reader can tell a finished record from a partial one.
+ */
+function fakeHerdrBinary() {
+  const dir = fs.mkdtempSync(join(os.tmpdir(), "octo-herdr-bin-"));
+  tempDirs.push(dir);
+  const logPath = join(dir, "reports");
+  const binPath = join(dir, "herdr");
+  fs.writeFileSync(
+    binPath,
+    `#!/bin/sh\n{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const records = () => {
+    if (!fs.existsSync(logPath)) return [];
+    const chunks = fs.readFileSync(logPath, "utf8").split(`${RECORD_END}\n`);
+    // The final chunk is whatever came after the last marker: nothing, unless a call is in flight.
+    chunks.pop();
+    return chunks.map(chunk => chunk.slice(0, -1).split("\n"));
+  };
+
+  return {
+    binPath,
+    async calls(count: number): Promise<string[][]> {
+      await waitFor(() => records().length >= count);
+      return records();
+    },
   };
 }
 
@@ -176,9 +222,22 @@ describe("herdrStatusFor", () => {
     });
   });
 
-  it("reports idle when the user is steering after rejecting a tool", () => {
+  it("reports blocked while the user writes a message to replace a rejected tool", () => {
     expect(herdrStatusFor(liveMode("tool-call-permission", AWAITING_STEERING))).toEqual({
-      state: "idle",
+      state: "blocked",
+      message: "Waiting for your message",
+    });
+  });
+
+  /*
+   * The store resets permissionUi to idle in the same update that installs tool-call-permission,
+   * and only pushes the prompt afterwards. Reporting idle in that window would flicker the sidebar
+   * and could fire a spurious "ready" notification mid-turn.
+   */
+  it("reports blocked in the gap before the permission prompt is pushed", () => {
+    expect(herdrStatusFor(liveMode("tool-call-permission"))).toEqual({
+      state: "blocked",
+      message: "Waiting for permission",
     });
   });
 
@@ -219,11 +278,11 @@ describe("herdrStatusFor", () => {
 
 describe("herdrReportFor", () => {
   it("reports nothing before a session is booted", () => {
-    expect(herdrReportFor({ mode: "booting" })).toBeNull();
+    expect(herdrReportFor({ mode: "booting" }, null)).toBeNull();
   });
 
   it("reports a blocked pane when the session is lost", () => {
-    expect(herdrReportFor({ mode: "lost" })).toEqual({
+    expect(herdrReportFor({ mode: "lost" }, null)).toEqual({
       state: "blocked",
       message: "Session lost",
     });
@@ -245,33 +304,64 @@ describe("herdrReportFor", () => {
   });
 });
 
-describe("resolveResumeCommand", () => {
-  it("resolves the command Herdr would re-run", () => {
-    expect(resolveResumeCommand({ PATH: binDir(["octo"]) })).toBe("octo");
+describe("herdrSettingsFor", () => {
+  it("defaults to reporting as octofriend, resuming with octo", () => {
+    expect(herdrSettingsFor(undefined, { PATH: binDir(["octo"]) })).toEqual({
+      enabled: true,
+      agentName: "octofriend",
+      resumeCommand: "octo",
+    });
   });
 
-  it("offers nothing when the command isn't on PATH", () => {
-    expect(resolveResumeCommand({ PATH: binDir([]) })).toBeNull();
-    expect(resolveResumeCommand({})).toBeNull();
+  it("offers no resume command when it isn't on PATH", () => {
+    expect(herdrSettingsFor(undefined, { PATH: binDir([]) }).resumeCommand).toBeNull();
+    expect(herdrSettingsFor(undefined, {}).resumeCommand).toBeNull();
   });
 
   it("ignores PATH entries that aren't executable files", () => {
     const withDirectory = binDir([]);
     fs.mkdirSync(join(withDirectory, "octo"));
-    expect(resolveResumeCommand({ PATH: withDirectory })).toBeNull();
+    expect(herdrSettingsFor(undefined, { PATH: withDirectory }).resumeCommand).toBeNull();
 
     const withPlainFile = binDir([]);
     fs.writeFileSync(join(withPlainFile, "octo"), "not executable", { mode: 0o644 });
-    expect(resolveResumeCommand({ PATH: withPlainFile })).toBeNull();
+    expect(herdrSettingsFor(undefined, { PATH: withPlainFile }).resumeCommand).toBeNull();
   });
 
   it("never resumes a canary session with the released build", () => {
-    // canary.sh's `canary-octo` is a shell function, so Herdr can't run it, and the `octo` on
-    // PATH would be a different build than the one running the session.
-    expect(resolveResumeCommand({ CANARY_OCTO: "1", PATH: binDir(["octo"]) })).toBeNull();
-    expect(resolveResumeCommand({ CANARY_OCTO: "1", PATH: binDir(["canary-octo"]) })).toBe(
-      "canary-octo",
+    // A canary session resumed by the released `octo` would silently come back as a different
+    // build, so with no `canary-octo` on PATH there is no resume command at all.
+    expect(
+      herdrSettingsFor(undefined, { CANARY_OCTO: "1", PATH: binDir(["octo"]) }).resumeCommand,
+    ).toBeNull();
+    expect(
+      herdrSettingsFor(undefined, { CANARY_OCTO: "1", PATH: binDir(["canary-octo"]) })
+        .resumeCommand,
+    ).toBe("canary-octo");
+  });
+
+  it("uses the configured name and commands", () => {
+    const herdr = {
+      agentName: "octo-main",
+      resume: { command: "octo-dev", canaryCommand: "octo-canary-dev" },
+    };
+    const path = binDir(["octo-dev", "octo-canary-dev"]);
+    expect(herdrSettingsFor(herdr, { PATH: path })).toEqual({
+      enabled: true,
+      agentName: "octo-main",
+      resumeCommand: "octo-dev",
+    });
+    expect(herdrSettingsFor(herdr, { CANARY_OCTO: "1", PATH: path }).resumeCommand).toBe(
+      "octo-canary-dev",
     );
+  });
+
+  it("turns reporting off when the config says so", () => {
+    expect(herdrSettingsFor({ enabled: false }, { PATH: binDir(["octo"]) })).toEqual({
+      enabled: false,
+      agentName: "octofriend",
+      resumeCommand: "octo",
+    });
   });
 });
 
@@ -292,7 +382,10 @@ describe("herdrResumeFor", () => {
     });
   });
 
-  it("resumes docker sessions without the docker subcommand, which the session records", () => {
+  it("resumes a docker session by id, since the session records its container", () => {
+    // `octo --resume` rebuilds the transport from the stored session, so the docker subcommand and
+    // its target live in the database rather than in this argv. A docker-run session starts a fresh
+    // container from the recorded args, which is what resuming one by hand does too.
     expect(
       herdrResumeFor(
         sessionFor("session-2", { kind: "docker-connect", target: "my-container" }),
@@ -301,6 +394,15 @@ describe("herdrResumeFor", () => {
     ).toEqual({
       sessionId: "session-2",
       argv: ["octo", "--resume", "session-2"],
+    });
+    expect(
+      herdrResumeFor(
+        sessionFor("session-3", { kind: "docker-run", dockerRunArgs: ["-i", "alpine"] }),
+        "octo",
+      ),
+    ).toEqual({
+      sessionId: "session-3",
+      argv: ["octo", "--resume", "session-3"],
     });
   });
 
@@ -318,12 +420,21 @@ describe("herdrResumeFor", () => {
     ).toBeNull();
     expect(herdrResumeFor(sessionFor(null), "octo")).toBeNull();
   });
+
+  it("drops a resume command over Herdr's size limit", () => {
+    expect(
+      herdrResumeFor(
+        sessionFor("session-1", { kind: "local", config: `/tmp/${"x".repeat(9 * 1024)}.json5` }),
+        "octo",
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("createHerdrReporter", () => {
   it("reports state through the Herdr binary in the current pane", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.report({ state: "working" });
 
@@ -346,7 +457,7 @@ describe("createHerdrReporter", () => {
 
   it("keeps Octo out of Herdr's way", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.report({ state: "idle" });
 
@@ -360,7 +471,7 @@ describe("createHerdrReporter", () => {
 
   it("attaches a block's explanation and the session's resume command", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.report({
       state: "blocked",
@@ -391,20 +502,37 @@ describe("createHerdrReporter", () => {
     ]);
   });
 
+  it("uses the agent name from the config", () => {
+    const transport = new MockTransport({});
+    const reporter = reporterFor(transport, "octo-canary");
+
+    reporter.report({ state: "idle" });
+    reporter.release();
+
+    expect(transport.spawnCalls[0].args[transport.spawnCalls[0].args.indexOf("--agent") + 1]).toBe(
+      "octo-canary",
+    );
+    expect(transport.spawnCalls[1].args[transport.spawnCalls[1].args.indexOf("--agent") + 1]).toBe(
+      "octo-canary",
+    );
+  });
+
   it("increases seq across reports", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.report({ state: "working" });
     transport.spawnCalls[0].process.finish(0, null);
     reporter.report({ state: "idle" });
 
-    expect(seqOf(transport.spawnCalls[1])).toBeGreaterThan(seqOf(transport.spawnCalls[0]));
+    expect(seqOf(transport.spawnCalls[1].args)).toBeGreaterThan(
+      seqOf(transport.spawnCalls[0].args),
+    );
   });
 
   it("drops queued reports in favor of the latest state", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.report({ state: "working" });
     reporter.report({ state: "blocked" });
@@ -422,7 +550,7 @@ describe("createHerdrReporter", () => {
         throw new Error("herdr is not there");
       },
     } as unknown as Transport;
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport: failing });
+    const reporter = reporterFor(failing);
 
     reporter.report({ state: "working" });
     reporter.release();
@@ -430,7 +558,7 @@ describe("createHerdrReporter", () => {
 
   it("releases the pane on exit, and stops reporting afterwards", () => {
     const transport = new MockTransport({});
-    const reporter = createHerdrReporter({ env: HERDR_ENV, transport });
+    const reporter = reporterFor(transport);
 
     reporter.release();
     reporter.release();
@@ -451,11 +579,98 @@ describe("createHerdrReporter", () => {
   });
 });
 
+/*
+ * The wire format Herdr actually receives, through a real subprocess rather than a mock: this is
+ * the test to read when asking what Octo sends the Herdr binary.
+ */
+describe("reports sent to a real Herdr binary", () => {
+  it("sends the state, the block's message, and the resume command", async () => {
+    const herdr = fakeHerdrBinary();
+    const reporter = createHerdrReporter({
+      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      agentName: "octofriend",
+      transport: new LocalTransport(),
+    });
+
+    reporter.report({
+      state: "blocked",
+      message: "Waiting for permission: shell",
+      resume: { sessionId: "session-1", argv: ["octo", "--unchained", "--resume", "session-1"] },
+    });
+
+    const [record] = await herdr.calls(1);
+    expect(maskSeq(record)).toEqual([
+      "pane",
+      "report-agent",
+      "pane-7",
+      "--source",
+      "octofriend",
+      "--agent",
+      "octofriend",
+      "--state",
+      "blocked",
+      "--seq",
+      "<seq>",
+      "--message",
+      "Waiting for permission: shell",
+      "--agent-session-id",
+      "session-1",
+      "--",
+      "octo",
+      "--unchained",
+      "--resume",
+      "session-1",
+    ]);
+  });
+
+  it("releases the pane with a higher seq than the reports before it", async () => {
+    const herdr = fakeHerdrBinary();
+    const reporter = createHerdrReporter({
+      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      agentName: "octofriend",
+      transport: new LocalTransport(),
+    });
+
+    reporter.report({ state: "idle" });
+    // Let the report land before releasing: the stub appends to one file, and two invocations
+    // writing at once would interleave their arguments.
+    await herdr.calls(1);
+    reporter.release();
+
+    const [report, release] = await herdr.calls(2);
+    expect(maskSeq(report)).toEqual([
+      "pane",
+      "report-agent",
+      "pane-7",
+      "--source",
+      "octofriend",
+      "--agent",
+      "octofriend",
+      "--state",
+      "idle",
+      "--seq",
+      "<seq>",
+    ]);
+    expect(maskSeq(release)).toEqual([
+      "pane",
+      "release-agent",
+      "pane-7",
+      "--source",
+      "octofriend",
+      "--agent",
+      "octofriend",
+      "--seq",
+      "<seq>",
+    ]);
+    expect(seqOf(release)).toBeGreaterThan(seqOf(report));
+  });
+});
+
 describe("startHerdrIntegration", () => {
   it("does nothing outside a Herdr pane", () => {
     const transport = new MockTransport({});
     const source = fakeSource({ mode: "booting" });
-    const stop = startHerdrIntegration({ env: null, transport, source });
+    const stop = startHerdrIntegration({ env: null, settings: settings(), transport, source });
 
     source.set(liveState({ mode: "responding", sessionId: "session-1" }));
     stop();
@@ -463,10 +678,27 @@ describe("startHerdrIntegration", () => {
     expect(transport.spawnCalls).toHaveLength(0);
   });
 
+  it("does nothing when the config turns it off", () => {
+    const transport = new MockTransport({});
+    const source = fakeSource({ mode: "booting" });
+    const stop = startHerdrIntegration({
+      env: HERDR_ENV,
+      settings: settings({ enabled: false }),
+      transport,
+      source,
+    });
+
+    source.set(liveState({ mode: "responding", sessionId: "session-1" }));
+    stop();
+
+    expect(transport.spawnCalls).toHaveLength(0);
+    expect(source.listenerCount()).toBe(0);
+  });
+
   it("reports state changes, skipping reports that change nothing", () => {
     const transport = new MockTransport({});
     const source = fakeSource({ mode: "booting" });
-    const stop = startHerdrIntegration({ env: HERDR_ENV, transport, source });
+    const stop = startHerdrIntegration({ env: HERDR_ENV, settings: settings(), transport, source });
     expect(transport.spawnCalls).toHaveLength(0);
 
     source.set(liveState({ mode: "responding", sessionId: "session-1" }));
@@ -488,29 +720,65 @@ describe("startHerdrIntegration", () => {
   });
 
   it("reports the resume command as soon as the session has an id", () => {
-    withPath(binDir(["octo"]), () => {
-      const transport = new MockTransport({});
-      const session = sessionFor(null);
-      const source = fakeSource({ mode: "live", liveMode: liveMode("ready-for-request"), session });
-      startHerdrIntegration({ env: HERDR_ENV, transport, source });
-
-      // Nothing to resume until Octo has persisted something worth remembering.
-      expect(transport.spawnCalls[0].args).not.toContain("--agent-session-id");
-
-      // Octo assigns the session id when the first history item is persisted.
-      session.metadata.sessionId = "session-1";
-      source.set({ mode: "live", liveMode: liveMode("responding"), session });
-      transport.spawnCalls[0].process.finish(0, null);
-
-      const args = withoutSeq(transport.spawnCalls[1]);
-      expect(args.slice(args.indexOf("--agent-session-id"))).toEqual([
-        "--agent-session-id",
-        "session-1",
-        "--",
-        "octo",
-        "--resume",
-        "session-1",
-      ]);
+    const transport = new MockTransport({});
+    const session = sessionFor(null);
+    const source = fakeSource({ mode: "live", liveMode: liveMode("ready-for-request"), session });
+    startHerdrIntegration({
+      env: HERDR_ENV,
+      settings: settings({ resumeCommand: "octo" }),
+      transport,
+      source,
     });
+
+    // Nothing to resume until Octo has persisted something worth remembering.
+    expect(transport.spawnCalls[0].args).not.toContain("--agent-session-id");
+
+    // Octo assigns the session id when the first history item is persisted.
+    session.metadata.sessionId = "session-1";
+    source.set({ mode: "live", liveMode: liveMode("responding"), session });
+    transport.spawnCalls[0].process.finish(0, null);
+
+    const args = withoutSeq(transport.spawnCalls[1]);
+    expect(args.slice(args.indexOf("--agent-session-id"))).toEqual([
+      "--agent-session-id",
+      "session-1",
+      "--",
+      "octo",
+      "--resume",
+      "session-1",
+    ]);
+  });
+
+  it("reports the new session rather than releasing when the session changes", () => {
+    const transport = new MockTransport({});
+    const source = fakeSource({
+      mode: "live",
+      liveMode: liveMode("ready-for-request"),
+      session: sessionFor("session-1"),
+    });
+    startHerdrIntegration({
+      env: HERDR_ENV,
+      settings: settings({ resumeCommand: "octo" }),
+      transport,
+      source,
+    });
+    transport.spawnCalls[0].process.finish(0, null);
+
+    source.set({
+      mode: "live",
+      liveMode: liveMode("ready-for-request"),
+      session: sessionFor("session-2"),
+    });
+
+    const args = withoutSeq(transport.spawnCalls[1]);
+    expect(args[1]).toBe("report-agent");
+    expect(args.slice(args.indexOf("--agent-session-id"))).toEqual([
+      "--agent-session-id",
+      "session-2",
+      "--",
+      "octo",
+      "--resume",
+      "session-2",
+    ]);
   });
 });

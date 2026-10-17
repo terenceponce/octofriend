@@ -166,6 +166,17 @@ const AutofixModelConfigSchema = t.exact({
   model: t.str,
 });
 
+/*
+ * Herdr (https://herdr.dev) runs the resume command itself when it restores a pane, so its first
+ * word has to be a bare command name on the user's PATH: it rejects a path, whitespace, quotes, or
+ * control characters with `invalid_resume_argv`. Catching that here means a bad config fails
+ * loudly at startup instead of silently costing the user their pane restore.
+ */
+const ResumeCommandSchema = t.str.validate(
+  "a command name: no whitespace, slashes, quotes, or control characters",
+  command => !/[\s/'"]/.test(command) && !/[\u0000-\u001f\u007f]/.test(command),
+);
+
 const ConfigSchema = t.exact({
   configVersion: t.optional(t.num),
   yourName: t.str,
@@ -197,6 +208,23 @@ const ConfigSchema = t.exact({
       notifyCommand: t.str,
       notifyTimeoutMs: t.optional(t.num),
       alwaysNotify: t.optional(t.bool),
+    }),
+  ),
+  /*
+   * Reporting to Herdr (https://herdr.dev) is automatic inside a Herdr pane and a no-op everywhere
+   * else, so this section is only for opting out, renaming the agent, or overriding the commands
+   * Herdr re-runs to restore a pane.
+   */
+  herdr: t.optional(
+    t.subtype({
+      enabled: t.optional(t.bool),
+      agentName: t.optional(t.str),
+      resume: t.optional(
+        t.subtype({
+          command: t.optional(ResumeCommandSchema),
+          canaryCommand: t.optional(ResumeCommandSchema),
+        }),
+      ),
     }),
   ),
 });

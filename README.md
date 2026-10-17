@@ -404,7 +404,71 @@ notifications: {
 },
 ```
 
+## Herdr
+
+[Herdr](https://herdr.dev) is a terminal workspace manager for coding agents. If
+you run Octo in one of its panes, Octo registers itself with Herdr automatically:
+you'll see it in the sidebar and in `herdr agent list`, showing which Octo is
+working, which is waiting on you, and which is done. When Octo parks on a
+permission prompt, a failed request, or a lost session, Herdr shows the reason
+and can notify you about it, and `herdr agent wait` works on Octo as well.
+
+None of this happens outside a Herdr pane: Octo only reports when the
+`HERDR_ENV`, `HERDR_PANE_ID`, and `HERDR_BIN_PATH` variables Herdr sets are all
+present.
+
+When a Herdr server restarts, Herdr reopens each pane and runs the command Octo
+gave it, so your session comes back in the same directory:
+
+```bash
+octo --unchained --resume <session-id>
+```
+
+Octo reports whichever of `--config` and `--unchained` the session was started
+with, so a restored session behaves like the original one. Restoring needs Herdr
+0.9.2 or newer, and needs the command Herdr is asked to run (`octo`, or
+`canary-octo` for a canary build) to be on your `PATH`. If it isn't, Octo leaves
+the resume command off the report and Herdr opens a plain shell instead.
+
+Sessions that ran inside Docker restore the same way: a `docker connect` session
+reconnects to its container, and a `docker run` session starts a fresh container
+from the same arguments.
+
+To turn reporting off, or to change the name Herdr shows, add a `herdr` block to
+your `~/.config/octofriend/octofriend.json5`:
+
+```json5
+herdr: {
+  // Report Octo's state to Herdr. Only used inside a Herdr pane.
+  enabled: true,
+  // The name shown in Herdr's sidebar and in `herdr agent list`.
+  agentName: "octofriend",
+  resume: {
+    // The command Herdr re-runs to restore a pane, for a released build...
+    command: "octo",
+    // ...and for a canary build, which runs from your checkout instead.
+    canaryCommand: "canary-octo",
+  },
+},
+```
+
+To check what Herdr sees, run these from inside the pane:
+
+```bash
+herdr pane get "$HERDR_PANE_ID"
+herdr agent list
+```
+
+Herdr's own documentation for agent authors is at
+[herdr.dev/docs/add-herdr-support](https://herdr.dev/docs/add-herdr-support/).
+
 ## Opting into canary versions
 
-If you want to use unreleased versions of Octo, clone this repo and read the
-instructions in `canary.sh` to install `canary-octo` in your shell.
+If you want to use unreleased versions of Octo, clone this repo and source
+`canary.sh` or `canary.fish` in your shell config, as described in the comments
+at the top of those files. That puts the checkout's `bin/` directory on your
+`PATH`, giving you a `canary-octo` command that runs the checkout, plus a
+`canary-octo` shell function that rebuilds from source before running. Because
+`canary-octo` is a real command rather than just a shell function, other things
+can run it by name too, such as a Herdr pane restoring your session after a
+server restart.

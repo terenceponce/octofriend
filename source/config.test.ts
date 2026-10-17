@@ -153,6 +153,51 @@ describe("readAuthForModel", () => {
   });
 });
 
+async function withConfigFixture<T>(
+  config: unknown,
+  run: (config: Config) => Promise<T>,
+): Promise<T> {
+  const configPath = await writeConfigFixture(config);
+  try {
+    return await run(await readConfig(configPath));
+  } finally {
+    await fs.rm(path.dirname(configPath), { recursive: true, force: true });
+  }
+}
+
+describe("herdr config", () => {
+  it("reads a Herdr section that names the agent and the resume commands", async () => {
+    const herdr = {
+      enabled: false,
+      agentName: "octo-main",
+      resume: { command: "octo-dev", canaryCommand: "octo-canary-dev" },
+    };
+
+    await withConfigFixture({ yourName: "test", models: [], herdr }, async config => {
+      expect(config.herdr).toEqual(herdr);
+    });
+  });
+
+  it("reads configs with no Herdr section at all", async () => {
+    await withConfigFixture({ yourName: "test", models: [] }, async config => {
+      expect(config.herdr).toBeUndefined();
+    });
+  });
+
+  it("rejects a resume command Herdr would refuse to run", async () => {
+    // Herdr runs the resume command itself, and answers invalid_resume_argv for a path, extra
+    // arguments, quotes, or control characters, which would cost the user their pane restore.
+    for (const command of ["/usr/local/bin/octo", "octo --unchained", "octo'dev", "octo\tdev"]) {
+      await expect(
+        withConfigFixture(
+          { yourName: "test", models: [], herdr: { resume: { command } } },
+          async () => {},
+        ),
+      ).rejects.toThrow();
+    }
+  });
+});
+
 async function writeConfigFixture(config: unknown): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "octo-config-test-"));
   const configPath = path.join(dir, "config.json5");
