@@ -22,6 +22,7 @@ import type { TrajectoryMode } from "./libocto/trajectory.ts";
 import type { Transport } from "./transports/transport-common.ts";
 import { LocalTransport } from "./transports/local.ts";
 import { MockTransport, type MockProcessCall } from "./transports/mock.ts";
+import { fakeHerdrBinary } from "./test/fake-herdr.ts";
 
 const HERDR_ENV: HerdrEnv = { binPath: "/opt/herdr/bin/herdr", paneId: "pane-7" };
 
@@ -148,36 +149,15 @@ function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
   });
 }
 
-const RECORD_END = "--end--";
-
-/*
- * A stand-in for HERDR_BIN_PATH that records the argv it was called with, one argument per line,
- * with a marker between calls so a reader can tell a finished record from a partial one.
- */
-function fakeHerdrBinary() {
-  const dir = fs.mkdtempSync(join(os.tmpdir(), "octo-herdr-bin-"));
-  tempDirs.push(dir);
-  const logPath = join(dir, "reports");
-  const binPath = join(dir, "herdr");
-  fs.writeFileSync(
-    binPath,
-    `#!/bin/sh\n{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
-  );
-  fs.chmodSync(binPath, 0o755);
-
-  const records = () => {
-    if (!fs.existsSync(logPath)) return [];
-    const chunks = fs.readFileSync(logPath, "utf8").split(`${RECORD_END}\n`);
-    // The final chunk is whatever came after the last marker: nothing, unless a call is in flight.
-    chunks.pop();
-    return chunks.map(chunk => chunk.slice(0, -1).split("\n"));
-  };
-
+/* A stub HERDR_BIN_PATH that records the argv it receives, so tests can read the wire format. */
+function herdrStub() {
+  const herdr = fakeHerdrBinary();
+  tempDirs.push(herdr.dir);
   return {
-    binPath,
+    binPath: herdr.binPath,
     async calls(count: number): Promise<string[][]> {
-      await waitFor(() => records().length >= count);
-      return records();
+      await waitFor(() => herdr.records().length >= count);
+      return herdr.records();
     },
   };
 }
@@ -585,7 +565,7 @@ describe("createHerdrReporter", () => {
  */
 describe("reports sent to a real Herdr binary", () => {
   it("sends the state, the block's message, and the resume command", async () => {
-    const herdr = fakeHerdrBinary();
+    const herdr = herdrStub();
     const reporter = createHerdrReporter({
       env: { binPath: herdr.binPath, paneId: "pane-7" },
       agentName: "octofriend",
@@ -624,7 +604,7 @@ describe("reports sent to a real Herdr binary", () => {
   });
 
   it("releases the pane with a higher seq than the reports before it", async () => {
-    const herdr = fakeHerdrBinary();
+    const herdr = herdrStub();
     const reporter = createHerdrReporter({
       env: { binPath: herdr.binPath, paneId: "pane-7" },
       agentName: "octofriend",

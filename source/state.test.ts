@@ -44,6 +44,8 @@ import type { LoadedTools, ToolCall } from "./libocto/tool-def.ts";
 import type { octoAgent } from "./ir/octo-ir.ts";
 import type toolMap from "./tools/tool-defs/index.ts";
 import { LocalTransport } from "./transports/local.ts";
+import { startHerdrIntegration } from "./herdr.ts";
+import { fakeHerdrBinary, stateOf } from "./test/fake-herdr.ts";
 
 /*
  * Integration tests for the octo store wiring around libocto's Trajectory: history persistence
@@ -239,6 +241,14 @@ function okResult(output: OctoAssistant): Result<CompilerSuccessData<OctoAgent>,
 
 function plain(content: string): CompilerQueueItem {
   return () => okResult(assistantMessage({ content }));
+}
+
+// A compiler that takes its time, so a test can watch the states Octo reports mid-turn.
+function slow(item: CompilerQueueItem, delayMs = 100): CompilerQueueItem {
+  return async (onTokens, params) => {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return item(onTokens, params);
+  };
 }
 
 // Parked error mode if a test under-queues: a never-rejected run promise would hit state.ts's
@@ -1082,5 +1092,70 @@ describe("inputFieldAvailable", () => {
 
   it("is hidden when aborted", () => {
     expect(inputFieldAvailable({ root: true, mode: "aborted" }, idle)).toBe(false);
+  });
+});
+
+/*
+ * End-to-end Herdr reporting: a real session driven through the store, with a stub binary standing
+ * in for HERDR_BIN_PATH, asserting on the reports Octo actually sends and their order. This lives
+ * here rather than in herdr.test.ts because it needs the session harness above.
+ */
+describe("herdr reporting", () => {
+  it("reports working and then blocked at a permission prompt, never idle in between", async () => {
+    const call = shellCall("call_a", "echo herdr-marker");
+    const { session } = await bootSession([
+      slow(() => okResult(assistantMessage({ toolCalls: [call] }))),
+      plain("herdr-final-marker"),
+    ]);
+
+    // Start reporting once this session is booted: the store is shared across this file, so
+    // otherwise the first thing reported would be whatever session the previous test left behind.
+    const herdr = fakeHerdrBinary();
+    tempDirs.push(herdr.dir);
+    const stopHerdr = startHerdrIntegration({
+      env: { binPath: herdr.binPath, paneId: "pane-7" },
+      settings: { enabled: true, agentName: "octofriend", resumeCommand: "octo" },
+      transport: new LocalTransport(),
+      source: useAppStore,
+    });
+
+    try {
+      // Booting reports idle, which is also what tells Herdr this source holds the pane. Wait for
+      // it before driving the turn, so the turn's reports can't get coalesced into it.
+      await herdr.waitForCall(record => stateOf(record) === "idle");
+
+      await respond("run it");
+      const prompt = await waitPermissionUi("prompt");
+      const reports = await herdr.waitForCall(
+        record => stateOf(record) === "blocked" && record.includes("Waiting for permission: shell"),
+      );
+
+      /*
+       * The store installs tool-call-permission with its permission UI reset to idle, and only
+       * pushes the prompt afterwards. Mapping that reset through would report idle in the middle of
+       * the turn: a flicker in Herdr's sidebar, and a spurious "ready" notification.
+       */
+      const states = reports.map(stateOf);
+      const working = states.indexOf("working");
+      expect(states.slice(working, working + 2)).toEqual(["working", "blocked"]);
+
+      await waitForNextTurn(() => prompt.control.allow());
+
+      // Octo re-reports once the session gains its id, so Herdr learns a command it can re-run to
+      // bring this session back after a server restart.
+      const storeSession = currentLive()!.session;
+      expect(storeSession.metadata.sessionId).toBe(session.metadata.sessionId);
+      const sessionId = session.metadata.sessionId!;
+      const resumed = await herdr.waitForCall(record => record.includes(sessionId));
+
+      const resumedReport = resumed[resumed.length - 1];
+      expect(resumedReport.slice(resumedReport.indexOf("--") + 1)).toEqual([
+        "octo",
+        "--resume",
+        sessionId,
+      ]);
+    } finally {
+      stopHerdr();
+    }
   });
 });
