@@ -9,7 +9,9 @@ import {
   herdrReportFor,
   herdrResumeFor,
   herdrSettingsFor,
+  herdrSkillOffer,
   herdrStatusFor,
+  installHerdrSkill,
   readHerdrCapabilities,
   readHerdrEnv,
   startHerdrIntegration,
@@ -157,8 +159,10 @@ function waitFor(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
 }
 
 /* A stub HERDR_BIN_PATH that records the argv it receives, so tests can read the wire format. */
-function herdrStub(versions?: { client: string; server: string }) {
-  const herdr = fakeHerdrBinary({ versions });
+function herdrStub(
+  options: { versions?: { client: string; server: string }; skill?: string } = {},
+) {
+  const herdr = fakeHerdrBinary(options);
   tempDirs.push(herdr.dir);
   return {
     binPath: herdr.binPath,
@@ -392,7 +396,7 @@ describe("herdrCapabilitiesFromStatus", () => {
 
 describe("readHerdrCapabilities", () => {
   it("reads what the Herdr binary in this pane understands", async () => {
-    const herdr = herdrStub({ client: "0.9.2", server: "0.9.2" });
+    const herdr = herdrStub({ versions: { client: "0.9.2", server: "0.9.2" } });
     expect(await readHerdrCapabilities(herdr.env, new LocalTransport())).toEqual(NEW_HERDR);
   });
 
@@ -405,6 +409,60 @@ describe("readHerdrCapabilities", () => {
     expect(await readHerdrCapabilities(null, new LocalTransport())).toEqual(
       CONSERVATIVE_HERDR_CAPABILITIES,
     );
+  });
+});
+
+describe("herdrSkillOffer", () => {
+  it("offers Herdr's skill inside a pane that doesn't have it", () => {
+    expect(herdrSkillOffer(HERDR_ENV, [])).toEqual(HERDR_ENV);
+    expect(herdrSkillOffer(HERDR_ENV, ["pr-review"])).toEqual(HERDR_ENV);
+    expect(herdrSkillOffer(HERDR_ENV, ["pr-review", "herdr"])).toBeNull();
+  });
+
+  it("stays quiet outside a pane", () => {
+    expect(herdrSkillOffer(null, [])).toBeNull();
+  });
+});
+
+describe("installHerdrSkill", () => {
+  const SKILL = `---\nname: herdr\ndescription: "Drive Herdr."\n---\n\n# Herdr\n`;
+  const tempSkillsDir = () => {
+    const dir = fs.mkdtempSync(join(os.tmpdir(), "octo-skills-"));
+    tempDirs.push(dir);
+    return dir;
+  };
+
+  it("writes the skill Herdr serves into the directory Octo loads skills from", async () => {
+    const herdr = herdrStub({ skill: SKILL });
+    const skillsDir = tempSkillsDir();
+
+    const path = await installHerdrSkill({
+      env: herdr.env,
+      transport: new LocalTransport(),
+      skillsDir,
+      signal: AbortSignal.timeout(5000),
+    });
+
+    // The loader requires the directory to match the skill's own name, so the frontmatter decides
+    // where the file lands rather than a name written by hand here.
+    expect(path).toBe(join(skillsDir, "herdr", "SKILL.md"));
+    expect(fs.readFileSync(path, "utf8")).toBe(SKILL);
+  });
+
+  it("writes nothing when Herdr answers with something that isn't a skill", async () => {
+    const herdr = herdrStub({ skill: "not a skill file" });
+    const skillsDir = tempSkillsDir();
+
+    await expect(
+      installHerdrSkill({
+        env: herdr.env,
+        transport: new LocalTransport(),
+        skillsDir,
+        signal: AbortSignal.timeout(5000),
+      }),
+    ).rejects.toThrow();
+
+    expect(fs.readdirSync(skillsDir)).toEqual([]);
   });
 });
 
@@ -628,7 +686,7 @@ describe("createHerdrReporter", () => {
  */
 describe("reports sent to a real Herdr binary", () => {
   it("sends the state, the block's message, and the resume command", async () => {
-    const herdr = herdrStub({ client: "0.9.2", server: "0.9.2" });
+    const herdr = herdrStub({ versions: { client: "0.9.2", server: "0.9.2" } });
     const transport = new LocalTransport();
     const capabilities = await readHerdrCapabilities(herdr.env, transport);
     expect(capabilities).toEqual(NEW_HERDR);
@@ -675,7 +733,7 @@ describe("reports sent to a real Herdr binary", () => {
     // Herdr 0.8.0 answers the trailing argv with `unknown option: --` and exits 2, and that
     // rejection takes the state report it rode on down with it: reporting the session there keeps
     // the pane permanently idle in Herdr's sidebar.
-    const herdr = herdrStub({ client: "0.8.0", server: "0.8.0" });
+    const herdr = herdrStub({ versions: { client: "0.8.0", server: "0.8.0" } });
     const transport = new LocalTransport();
     const capabilities = await readHerdrCapabilities(herdr.env, transport);
     expect(capabilities).toEqual(CONSERVATIVE_HERDR_CAPABILITIES);

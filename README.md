@@ -464,6 +464,12 @@ herdr pane get "$HERDR_PANE_ID"
 herdr agent list
 ```
 
+Octo can also drive Herdr itself — splitting panes, starting other agents, and waiting
+on them — using the skill Herdr ships for exactly that. Inside a Herdr pane, `ctrl+p`
+offers to install it ("Add Herdr's skill") when you don't have it yet; Octo fetches it
+from the Herdr binary in your pane and writes it to
+`~/.config/agents/skills/herdr/`, where every project's Octo will find it.
+
 Herdr's own documentation for agent authors is at
 [herdr.dev/docs/add-herdr-support](https://herdr.dev/docs/add-herdr-support/).
 

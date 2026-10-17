@@ -19,6 +19,7 @@ import { CustomAuthFlow } from "./components/add-model-flow.tsx";
 import { Span, useApp } from "paintcannon-react";
 import { TerminalFlex } from "./components/terminal-flex.tsx";
 import { LoadSessionMenu } from "./session-history/load-session-menu.tsx";
+import { errorToString } from "./libocto/result.ts";
 type MenuMode =
   | "main-menu"
   | "load-session"
@@ -45,7 +46,13 @@ const useMenuState = create<MenuState>((set, _) => ({
     });
   },
 }));
-export function Menu({ syntheticModels }: { syntheticModels: SyntheticModel[] }) {
+export function Menu({
+  syntheticModels,
+  installHerdrSkill,
+}: {
+  syntheticModels: SyntheticModel[];
+  installHerdrSkill: (() => Promise<string>) | null;
+}) {
   const { menuMode, setMenuMode } = useMenuState(
     useShallow(state => ({
       menuMode: state.menuMode,
@@ -66,6 +73,7 @@ export function Menu({ syntheticModels }: { syntheticModels: SyntheticModel[] })
     >
       <MenuContent
         syntheticModels={syntheticModels}
+        installHerdrSkill={installHerdrSkill}
         menuMode={menuMode}
         setMenuMode={setMenuMode}
       />
@@ -75,14 +83,16 @@ export function Menu({ syntheticModels }: { syntheticModels: SyntheticModel[] })
 
 function MenuContent({
   syntheticModels,
+  installHerdrSkill,
   menuMode,
   setMenuMode,
 }: {
   syntheticModels: SyntheticModel[];
+  installHerdrSkill: (() => Promise<string>) | null;
   menuMode: MenuMode;
   setMenuMode: (mode: MenuMode) => void;
 }) {
-  if (menuMode === "main-menu") return <MainMenu />;
+  if (menuMode === "main-menu") return <MainMenu installHerdrSkill={installHerdrSkill} />;
   if (menuMode === "load-session") {
     return <LoadSessionMenu onBack={() => setMenuMode("main-menu")} />;
   }
@@ -382,7 +392,7 @@ function filterSettings(config: Config) {
   }
   return items;
 }
-function MainMenu() {
+function MainMenu({ installHerdrSkill }: { installHerdrSkill: (() => Promise<string>) | null }) {
   const { toggleMenu, notify } = useAppStore(
     useShallow(state => ({
       toggleMenu: state.toggleMenu,
@@ -414,7 +424,8 @@ function MainMenu() {
     | "settings-menu"
     | "clear-confirm"
     | "notifications-menu"
-    | "usage-menu";
+    | "usage-menu"
+    | "herdr-skill-install";
   let items: Keymap<Value> = {
     m: {
       label: "⤭ Switch model",
@@ -501,6 +512,15 @@ function MainMenu() {
       },
     };
   }
+  if (installHerdrSkill) {
+    items = {
+      ...items,
+      i: {
+        label: "⤓ Add Herdr's skill",
+        value: "herdr-skill-install" as const,
+      },
+    };
+  }
   items = {
     ...items,
     b: {
@@ -531,9 +551,21 @@ function MainMenu() {
         notify(`Switched to ${wasEnabled ? "Emacs" : "Vim"} mode`);
         return;
       } else if (item.value === "clear-confirm") setMenuMode("clear-confirm");
-      else setMenuMode(item.value);
+      else if (item.value === "herdr-skill-install") {
+        if (installHerdrSkill == null) {
+          setMenuMode("main-menu");
+          return;
+        }
+        try {
+          notify(await installHerdrSkill());
+        } catch (error) {
+          notify(`Couldn't install Herdr's skill: ${errorToString(error)}`);
+        }
+        toggleMenu();
+        return;
+      } else setMenuMode(item.value);
     },
-    [config, setConfig, notify, session],
+    [config, setConfig, notify, session, installHerdrSkill, toggleMenu],
   );
   return (
     <KbShortcutPanel

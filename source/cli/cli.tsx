@@ -25,7 +25,7 @@ import type { ModelData } from "../compilers/run.ts";
 import { octoAgent } from "../ir/octo-ir.ts";
 import { loadInputHistory } from "../input-history/index.ts";
 import { makeAutofixJson } from "../compilers/autofix.ts";
-import { discoverSkills } from "../skills/skills.ts";
+import { discoverSkills, globalSkillsDir } from "../skills/skills.ts";
 import { timeout } from "../libocto/signals.ts";
 import { shutdownLspClients } from "../lsp/client.ts";
 import { replaceDockerRunArgs, replaceOctoFlags, withOctoFlags } from "./cli-args.ts";
@@ -44,6 +44,8 @@ import { renderInteractive } from "./render-interactive.tsx";
 import { setOctoTitles } from "./titles.ts";
 import {
   herdrSettingsFor,
+  herdrSkillOffer,
+  installHerdrSkill,
   readHerdrCapabilities,
   readHerdrEnv,
   startHerdrIntegration,
@@ -259,6 +261,29 @@ async function runMain(opts: {
     const skills = await discoverSkills(opts.transport, timeout(5000), config);
     const cwd = opts.transport.cwd;
 
+    /*
+     * Herdr ships a skill that teaches a coding agent to drive its panes, which is the point of the
+     * whole integration, so Octo offers to install it when it finds itself in a pane without it.
+     * The skill is fetched and written on the host: Herdr lives there, and so does the skill.
+     */
+    const herdrSkillFor = herdrSkillOffer(
+      herdrEnv,
+      skills.map(s => s.name),
+    );
+    const installHerdrSkillProp =
+      herdrSkillFor == null
+        ? null
+        : async () => {
+            const skillTransport = new LocalTransport();
+            const path = await installHerdrSkill({
+              env: herdrSkillFor,
+              transport: skillTransport,
+              skillsDir: await globalSkillsDir(skillTransport, timeout(5000)),
+              signal: timeout(5000),
+            });
+            return `Installed Herdr's skill at ${path}. Octo can use it in your next message.`;
+          };
+
     const store = useAppStore.getState();
     if (store.sessionMode.mode !== "booting") {
       throw new Error("impossible: cli booted with a session already in flight");
@@ -287,6 +312,7 @@ async function runMain(opts: {
       <App
         syntheticModels={syntheticModels}
         bootSkills={skills.map(s => s.name)}
+        installHerdrSkill={installHerdrSkillProp}
         config={config}
         configPath={configPath}
         cwd={cwd}

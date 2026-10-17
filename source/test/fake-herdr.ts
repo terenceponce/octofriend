@@ -11,28 +11,46 @@ const RECORD_END = "--end--";
  * Reports go out as real subprocesses, so this is what lets a test assert on the wire format and
  * the order of the reports Octo sends, without a Herdr install. Callers register `dir` for cleanup.
  */
-export function fakeHerdrBinary(options: { versions?: { client: string; server: string } } = {}) {
+export function fakeHerdrBinary(
+  options: { versions?: { client: string; server: string }; skill?: string } = {},
+) {
   const dir = fs.mkdtempSync(join(os.tmpdir(), "octo-herdr-bin-"));
   const logPath = join(dir, "reports");
   const binPath = join(dir, "herdr");
-  // A stub that answers `status --json` as a real Herdr from `options.versions` would, and records
-  // every other call's argv. Without versions it answers nothing, which is the probe failing.
-  const status =
-    options.versions == null
-      ? ""
-      : [
-          `if [ "$1" = "status" ]; then`,
-          `  printf '%s\\n' '${JSON.stringify({
-            client: { version: options.versions.client },
-            server: { version: options.versions.server },
-          })}'`,
-          `  exit 0`,
-          `fi`,
-          "",
-        ].join("\n");
+
+  /*
+   * A stub that answers the calls a real Herdr would when asked about itself — `status --json` from
+   * `options.versions`, `--skill` from `options.skill` — and records every other call's argv. When
+   * an answer isn't configured, the call gets no output at all, which is how a failure looks.
+   */
+  const answers: string[] = [];
+  if (options.versions != null) {
+    const status = JSON.stringify({
+      client: { version: options.versions.client },
+      server: { version: options.versions.server },
+    });
+    answers.push(
+      [`if [ "$1" = "status" ]; then`, `  printf '%s\\n' '${status}'`, `  exit 0`, `fi`].join("\n"),
+    );
+  }
+  if (options.skill != null) {
+    answers.push(
+      [
+        `if [ "$1" = "--skill" ]; then`,
+        `  cat <<'SKILL_END'`,
+        // The terminator abuts the body, which already ends in a newline, so Herdr's bytes come
+        // through unchanged.
+        `${options.skill}SKILL_END`,
+        `  exit 0`,
+        `fi`,
+      ].join("\n"),
+    );
+  }
+  const prefix = answers.length === 0 ? "" : `${answers.join("\n")}\n`;
+
   fs.writeFileSync(
     binPath,
-    `#!/bin/sh\n${status}{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
+    `#!/bin/sh\n${prefix}{\n  for arg in "$@"; do printf '%s\\n' "$arg"; done\n  printf '%s\\n' "${RECORD_END}"\n} >> "${logPath}"\n`,
   );
   fs.chmodSync(binPath, 0o755);
 

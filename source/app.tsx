@@ -144,6 +144,8 @@ type Props = {
   transport: Transport;
   inputHistory: InputHistory;
   bootSkills: string[];
+  // Installs Herdr's skill, offered only when Octo is in a Herdr pane without it. Null: no offer.
+  installHerdrSkill: (() => Promise<string>) | null;
   syntheticModels: SyntheticModel[];
 };
 type TranscriptItem =
@@ -194,6 +196,7 @@ export default function App({
   updates,
   inputHistory,
   bootSkills,
+  installHerdrSkill,
   syntheticModels,
 }: Props) {
   const { paintCannon } = useApp();
@@ -328,6 +331,12 @@ export default function App({
     skillNotifs.push(" ");
     skillNotifs.push("Configured skills:");
     skillNotifs.push(...bootSkills.map(s => `- ${s}`));
+  }
+  if (installHerdrSkill != null) {
+    skillNotifs.push(" ");
+    skillNotifs.push(
+      "Herdr detected: press ctrl+p to add Herdr's skill, which lets Octo drive its panes.",
+    );
   }
   const bootItems: TranscriptItem[] = useMemo(() => {
     const items = [
@@ -501,7 +510,10 @@ export default function App({
                 {sessionMode.mode === "live" && isMenuOpen && (
                   <Modal minWidth={50} onClose={closeMenu}>
                     <SessionContext.Provider value={sessionMode.session}>
-                      <Menu syntheticModels={syntheticModels} />
+                      <Menu
+                        syntheticModels={syntheticModels}
+                        installHerdrSkill={installHerdrSkill}
+                      />
                     </SessionContext.Provider>
                   </Modal>
                 )}

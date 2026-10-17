@@ -221,10 +221,18 @@ export function toPromptXML(skills: Skill[]): string {
   return lines.join("\n");
 }
 
+/*
+ * The skills directory shared by every project Octo runs in. It's also where Octo installs a skill
+ * it fetched for the user, so that discovery finds it on the next pass.
+ */
+export async function globalSkillsDir(transport: Transport, signal: AbortSignal): Promise<string> {
+  const home = await getEnvVar(signal, transport, "HOME", 5000);
+  return path.join(home, ".config/agents/skills");
+}
+
 async function getDefaultSkillsPaths(transport: Transport, signal: AbortSignal): Promise<string[]> {
   const paths: string[] = [];
-  const home = await getEnvVar(signal, transport, "HOME", 5000);
-  paths.push(path.join(home, ".config/agents/skills"));
+  paths.push(await globalSkillsDir(transport, signal));
   const pwd = transport.cwd;
   paths.push(path.join(pwd, ".agents", "skills"));
   return paths;

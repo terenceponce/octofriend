@@ -117,22 +117,74 @@ export async function readHerdrCapabilities(
 ): Promise<HerdrCapabilities> {
   if (env == null) return CONSERVATIVE_HERDR_CAPABILITIES;
   try {
-    const status = await new Promise<string>((resolve, reject) => {
-      transport.execFile(
-        env.binPath,
-        ["status", "--json"],
-        { timeout: PROBE_TIMEOUT_MS },
-        (error, stdout) => {
-          if (error == null) resolve(stdout);
-          else reject(error);
-        },
-      );
-    });
-    return herdrCapabilitiesFromStatus(status);
+    return herdrCapabilitiesFromStatus(
+      await execFileText(transport, env.binPath, ["status", "--json"]),
+    );
   } catch (error) {
     logger.error("verbose", `Could not read Herdr's capabilities: ${errorToString(error)}`);
     return CONSERVATIVE_HERDR_CAPABILITIES;
   }
+}
+
+function execFileText(transport: Transport, file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    transport.execFile(file, args, { timeout: PROBE_TIMEOUT_MS }, (error, stdout) => {
+      if (error == null) resolve(stdout);
+      else reject(error);
+    });
+  });
+}
+
+// The name Herdr's skill is installed under, so the offer and the install agree on it.
+export const HERDR_SKILL_NAME = "herdr";
+
+/*
+ * The pane to offer Herdr's own skill to, or null when there's no offer to make: the skill is only
+ * useful inside a pane, and only worth offering to someone who doesn't have it already.
+ */
+export function herdrSkillOffer(
+  env: HerdrEnv | null,
+  skillNames: readonly string[],
+): HerdrEnv | null {
+  if (env == null || skillNames.includes(HERDR_SKILL_NAME)) return null;
+  return env;
+}
+
+/*
+ * Writes the skill Herdr ships for agents that drive it — the same file `herdr --skill` prints —
+ * into the skills directory Octo searches. Octo's loader requires the containing directory to match
+ * the skill's own `name`, so the name is read from what Herdr sent rather than assumed.
+ *
+ * Herdr runs on the host and so does this skill, so the caller passes a local transport even when
+ * the session itself is sandboxed.
+ */
+export async function installHerdrSkill(args: {
+  env: HerdrEnv;
+  transport: Transport;
+  skillsDir: string;
+  signal: AbortSignal;
+}): Promise<string> {
+  const content = await execFileText(args.transport, args.env.binPath, ["--skill"]);
+  const name = skillNameFrom(content);
+  if (name == null) {
+    throw new Error("the skill Herdr returned has no name in its frontmatter");
+  }
+
+  const dir = join(args.skillsDir, name);
+  const path = join(dir, "SKILL.md");
+  await args.transport.mkdir(args.signal, dir);
+  await args.transport.writeFile(args.signal, path, content);
+  return path;
+}
+
+// The `name:` Octo's loader needs, read the way that loader reads it: frontmatter, first line.
+function skillNameFrom(content: string): string | null {
+  if (!content.startsWith("---\n")) return null;
+  const end = content.indexOf("\n---", 3);
+  if (end < 0) return null;
+  const match = /^name:[ \t]*(.+)$/m.exec(content.slice(4, end));
+  const name = match?.[1]?.trim().replace(/^["']|["']$/g, "");
+  return name != null && name !== "" ? name : null;
 }
 
 export type HerdrAgentState = "idle" | "working" | "blocked";
