@@ -1,21 +1,20 @@
 # To opt into canary builds, source this file in your config.fish
 # Usage: source /path/to/canary.fish
 #
-# This creates a canary-octo function that compiles a fresh binary from
-# whatever you have in your current octofriend checkout and runs it, allowing
-# you to use the main branch without waiting for new octo releases, or to use
-# an in-development branch easily.
+# This puts this checkout's bin/ directory on your PATH, providing a canary-octo
+# command that runs octofriend from your current octofriend checkout, allowing you
+# to use the main branch without waiting for new octo releases, or to use an
+# in-development branch easily.
+#
+# canary-octo is a real command rather than a shell function so that anything that
+# re-runs commands by name can use it, such as Herdr's session restore. The command
+# runs the last build; the shell function below passes --compile, so interactive
+# runs keep rebuilding from source first.
 
 set -g _OCTOFRIEND_DIR (status dirname)
 
+set -gx PATH "$_OCTOFRIEND_DIR/bin" $PATH
+
 function canary-octo
-    set -gx CANARY_OCTO 1
-    pushd "$_OCTOFRIEND_DIR" >/dev/null; or return 1
-    bun run compile
-    set -l compile_status $status
-    popd >/dev/null
-    if test $compile_status -ne 0
-        return $compile_status
-    end
-    "$_OCTOFRIEND_DIR/bin/octo.sh" $argv
+    command canary-octo --compile $argv
 end

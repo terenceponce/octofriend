@@ -42,6 +42,7 @@ import {
 } from "../session-history/session-list.ts";
 import { renderInteractive } from "./render-interactive.tsx";
 import { setOctoTitles } from "./titles.ts";
+import { readHerdrEnv, startHerdrIntegration } from "../herdr.ts";
 import changelog from "../../CHANGELOG.md" with { type: "text" };
 import { processes } from "../process-manager.ts";
 
@@ -196,11 +197,18 @@ async function runMain(opts: {
   loadedSession?: LoadedSession | null;
 }) {
   const restoreTitles = setOctoTitles();
+  // Reports Octo's state to Herdr when Octo runs in one of its panes, and does nothing otherwise.
+  const stopHerdr = startHerdrIntegration({
+    env: readHerdrEnv(),
+    transport: new LocalTransport(),
+    source: useAppStore,
+  });
   let cleanedUp = false;
   const cleanup = async () => {
     if (cleanedUp) return;
     cleanedUp = true;
     restoreTitles();
+    stopHerdr();
     await Promise.all([shutdownLspClients(), shutdownMcpClients()]);
   };
   const unregisterCleanup = processes.manager().registerOctoExitCleanup(cleanup);

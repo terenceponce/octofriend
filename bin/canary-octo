@@ -1,0 +1,25 @@
+#!/bin/sh
+# Runs the octofriend checkout that contains this script, the way the released `octo` command runs
+# a released build.
+#
+# canary.sh puts this directory on your PATH, so `canary-octo` is a real command: scripts, CI, and
+# tools that re-run commands by name (like Herdr's session restore) can use it, which they can't do
+# with a shell function. Callers that don't ask for a build get the last one, because rebuilding
+# from a dozen restored panes at once would fight over dist/ — pass --compile, or use canary.sh's
+# shell function, to rebuild from source first.
+
+set -eu
+
+dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+if [ "${1-}" = "--compile" ]; then
+  shift
+  (cd "$dir" && bun run compile) || exit 1
+fi
+
+# Mark the run as canary: Octo uses this to fail loudly on history bugs it would otherwise quietly
+# repair, and it knows not to report a released `octo` as this session's resume command.
+CANARY_OCTO=1
+export CANARY_OCTO
+
+exec "$dir/bin/octo.sh" "$@"

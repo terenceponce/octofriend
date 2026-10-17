@@ -1,10 +1,15 @@
 # To opt into canary builds, source this file in your .zshrc or .bashrc
 # Usage: source /path/to/canary.sh
 #
-# This creates a canary-octo function that compiles a fresh binary from
-# whatever you have in your current octofriend checkout and runs it, allowing
-# you to use the main branch without waiting for new octo releases, or to use
-# an in-development branch easily.
+# This puts this checkout's bin/ directory on your PATH, providing a canary-octo
+# command that runs octofriend from your current octofriend checkout, allowing you
+# to use the main branch without waiting for new octo releases, or to use an
+# in-development branch easily.
+#
+# canary-octo is a real command rather than a shell function so that anything that
+# re-runs commands by name can use it, such as Herdr's session restore. The command
+# runs the last build; the shell function below passes --compile, so interactive
+# runs keep rebuilding from source first.
 if [ -n "$ZSH_VERSION" ]; then
   _OCTOFRIEND_DIR="${0:A:h}"
 elif [ -n "$BASH_VERSION" ]; then
@@ -14,7 +19,9 @@ else
   return 1
 fi
 
+PATH="$_OCTOFRIEND_DIR/bin:$PATH"
+export PATH
+
 function canary-octo() {
-  (cd "$_OCTOFRIEND_DIR" && bun run compile) || return 1
-  CANARY_OCTO=1 "$_OCTOFRIEND_DIR/bin/octo.sh" "$@"
+  command canary-octo --compile "$@"
 }

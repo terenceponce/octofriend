@@ -48,10 +48,15 @@ export function withOctoFlags(cmd: Command) {
     );
 }
 
-export function buildFlagString(command: ParsedCliArgs): string[] {
+export function buildOctoFlags(command: ParsedCliArgs): string[] {
   const options: string[] = [];
   if (command.config != null) options.push("--config", command.config);
   if (command.unchained) options.push("--unchained");
+  return options;
+}
+
+export function buildFlagString(command: ParsedCliArgs): string[] {
+  const options = buildOctoFlags(command);
 
   switch (command.kind) {
     case "local":
